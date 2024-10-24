@@ -1,5 +1,9 @@
 //! Utility code to handle quic networking.
 
+use quinn::{EndpointConfig, TokioRuntime};
+use std::io::SeekFrom::End;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use log::info;
 use {
     quinn::{
         crypto::rustls::QuicClientConfig, ClientConfig, Connection, Endpoint, IdleTimeout,
@@ -15,6 +19,7 @@ pub mod error;
 pub mod quic_client_certificate;
 pub mod skip_server_verification;
 
+use solana_net_utils::VALIDATOR_PORT_RANGE;
 pub use {
     error::{IoErrorWithPartialEq, QuicError},
     quic_client_certificate::QuicClientCertificate,
@@ -51,12 +56,28 @@ pub(crate) fn create_client_config(client_certificate: Arc<QuicClientCertificate
 }
 
 pub(crate) fn create_client_endpoint(
-    bind_addr: SocketAddr,
+    bind: Option<SocketAddr>,
     client_config: ClientConfig,
 ) -> Result<Endpoint, QuicError> {
-    let mut endpoint = Endpoint::client(bind_addr).map_err(IoErrorWithPartialEq::from)?;
+    let mut endpoint = if let Some(bind_addr) = bind {
+        Endpoint::client(bind_addr).map_err(IoErrorWithPartialEq::from)?
+    } else {
+        let client_socket = solana_net_utils::bind_in_range(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            VALIDATOR_PORT_RANGE,
+        )
+        .expect("QuicLazyInitializedEndpoint::create_endpoint bind_in_range")
+        .1;
+        info!("create_client_endpoint: bound to: {}", client_socket.local_addr().unwrap());
+        create_endpoint(EndpointConfig::default(), client_socket)
+    };
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+pub(crate) fn create_endpoint(config: EndpointConfig, client_socket: UdpSocket) -> Endpoint {
+    quinn::Endpoint::new(config, None, client_socket, Arc::new(TokioRuntime))
+        .expect("QuicNewConnection::create_endpoint quinn::Endpoint::new")
 }
 
 pub(crate) async fn send_data_over_stream(

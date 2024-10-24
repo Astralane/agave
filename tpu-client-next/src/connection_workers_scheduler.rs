@@ -1,6 +1,9 @@
 //! This module defines [`ConnectionWorkersScheduler`] which sends transactions
 //! to the upcoming leaders.
 
+use quinn::{EndpointConfig, TokioRuntime};
+use solana_net_utils::VALIDATOR_PORT_RANGE;
+use std::net::{IpAddr, Ipv4Addr};
 use {
     super::{leader_updater::LeaderUpdater, SendTransactionStatsPerAddr},
     crate::{
@@ -46,7 +49,7 @@ pub enum ConnectionWorkersSchedulerError {
 /// behavior related to transaction handling.
 pub struct ConnectionWorkersSchedulerConfig {
     /// The local address to bind the scheduler to.
-    pub bind: SocketAddr,
+    pub bind: Option<SocketAddr>,
 
     /// Optional stake identity keypair used in the endpoint certificate for
     /// identifying the sender.
@@ -171,7 +174,7 @@ impl ConnectionWorkersScheduler {
 
     /// Sets up the QUIC endpoint for the scheduler to handle connections.
     fn setup_endpoint(
-        bind: SocketAddr,
+        bind: Option<SocketAddr>,
         validator_identity: Option<Keypair>,
     ) -> Result<Endpoint, ConnectionWorkersSchedulerError> {
         let client_certificate = if let Some(validator_identity) = validator_identity {
@@ -181,6 +184,7 @@ impl ConnectionWorkersScheduler {
         };
         let client_config = create_client_config(client_certificate);
         let endpoint = create_client_endpoint(bind, client_config)?;
+
         Ok(endpoint)
     }
 

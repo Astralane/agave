@@ -24,6 +24,7 @@ solana-tpu-client = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+solana-net-utils = { workspace = true }
 
 [dev-dependencies]
 crossbeam-channel = { workspace = true }

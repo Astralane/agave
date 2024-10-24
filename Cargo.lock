@@ -8464,6 +8464,7 @@ dependencies = [
  "solana-connection-cache",
  "solana-logger",
  "solana-measure",
+ "solana-net-utils",
  "solana-rpc-client",
  "solana-sdk",
  "solana-streamer",
