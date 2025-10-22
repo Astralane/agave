@@ -1,5 +1,6 @@
 //! Utility code to handle quic networking.
 
+use std::time::Duration;
 use {
     crate::connection_workers_scheduler::BindTarget,
     quinn::{
@@ -32,9 +33,9 @@ pub(crate) fn create_client_config(client_certificate: &QuicClientCertificate) -
     let transport_config = {
         let mut res = TransportConfig::default();
 
-        let timeout = IdleTimeout::try_from(QUIC_MAX_TIMEOUT).unwrap();
+        let timeout = IdleTimeout::try_from(Duration::from_secs(2)).unwrap();
         res.max_idle_timeout(Some(timeout));
-        res.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
+        res.keep_alive_interval(Some(Duration::from_secs(1)));
         res.send_fairness(QUIC_SEND_FAIRNESS);
 
         res
