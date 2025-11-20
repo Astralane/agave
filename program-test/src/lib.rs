@@ -13,7 +13,9 @@
 // Export tokio for test clients
 pub use tokio;
 use {
-    agave_feature_set::{raise_cpi_nesting_limit_to_8, FEATURE_NAMES},
+    agave_feature_set::{
+        increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FEATURE_NAMES,
+    },
     async_trait::async_trait,
     base64::{prelude::BASE64_STANDARD, Engine},
     chrono_humanize::{Accuracy, HumanTime, Tense},
@@ -70,6 +72,7 @@ use {
         mem::transmute,
         panic::AssertUnwindSafe,
         path::{Path, PathBuf},
+        ptr,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, RwLock,
@@ -107,12 +110,12 @@ fn set_invoke_context(new: &mut InvokeContext) {
         invoke_context.replace(Some(transmute::<&mut InvokeContext, usize>(new)))
     });
 }
-fn get_invoke_context<'a, 'b>() -> &'a mut InvokeContext<'b> {
+fn get_invoke_context<'a, 'b>() -> &'a mut InvokeContext<'b, 'b> {
     let ptr = INVOKE_CONTEXT.with(|invoke_context| match *invoke_context.borrow() {
         Some(val) => val,
         None => panic!("Invoke context not set!"),
     });
-    unsafe { transmute::<usize, &mut InvokeContext>(ptr) }
+    unsafe { &mut *ptr::with_exposed_provenance_mut(ptr) }
 }
 
 pub fn invoke_builtin_function(
@@ -504,7 +507,7 @@ impl Default for ProgramTest {
     /// * the current working directory
     ///
     fn default() -> Self {
-        solana_logger::setup_with_default(
+        agave_logger::setup_with_default(
             "solana_sbpf::vm=debug,solana_runtime::message_processor=debug,\
              solana_runtime::system_instruction_processor=trace,solana_program_test=info",
         );
@@ -859,6 +862,9 @@ impl ProgramTest {
                         genesis_config
                             .accounts
                             .contains_key(&raise_cpi_nesting_limit_to_8::id()),
+                        genesis_config
+                            .accounts
+                            .contains_key(&increase_cpi_account_info_limit::id()),
                     )
                 }),
                 transaction_account_lock_limit: self.transaction_account_lock_limit,

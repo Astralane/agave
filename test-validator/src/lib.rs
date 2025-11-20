@@ -1,9 +1,11 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    agave_feature_set::{alpenglow, raise_cpi_nesting_limit_to_8, FeatureSet, FEATURE_NAMES},
+    agave_feature_set::{
+        alpenglow, increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
+        FEATURE_NAMES,
+    },
     agave_snapshots::{
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE, snapshot_config::SnapshotConfig,
-        SnapshotInterval,
+        paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig, SnapshotInterval,
     },
     base64::{prelude::BASE64_STANDARD, Engine},
     crossbeam_channel::Receiver,
@@ -24,6 +26,7 @@ use {
     },
     solana_epoch_schedule::EpochSchedule,
     solana_fee_calculator::FeeRateGovernor,
+    solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
     solana_geyser_plugin_manager::{
         geyser_plugin_manager::GeyserPluginManager, GeyserPluginManagerRequest,
     },
@@ -42,7 +45,9 @@ use {
     solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_message::Message,
     solana_native_token::LAMPORTS_PER_SOL,
-    solana_net_utils::{find_available_ports_in_range, multihomed_sockets::BindIpAddrs, PortRange},
+    solana_net_utils::{
+        find_available_ports_in_range, multihomed_sockets::BindIpAddrs, PortRange, SocketAddrSpace,
+    },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
@@ -52,11 +57,10 @@ use {
         bank_forks::BankForks,
         genesis_utils::{self, create_genesis_config_with_leader_ex_no_features},
         runtime_config::RuntimeConfig,
-        snapshot_utils::BANK_SNAPSHOTS_DIR,
     },
     solana_sdk_ids::address_lookup_table,
     solana_signer::Signer,
-    solana_streamer::{quic::DEFAULT_QUIC_ENDPOINTS, socket::SocketAddrSpace},
+    solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
     solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     solana_transaction::Transaction,
     solana_validator_exit::Exit,
@@ -134,6 +138,7 @@ pub struct TestValidatorGenesis {
     pub max_ledger_shreds: Option<u64>,
     pub max_genesis_archive_unpacked_size: Option<u64>,
     pub geyser_plugin_config_files: Option<Vec<PathBuf>>,
+    pub enable_scheduler_bindings: bool,
     deactivate_feature_set: HashSet<Pubkey>,
     compute_unit_limit: Option<u64>,
     pub log_messages_bytes_limit: Option<usize>,
@@ -169,6 +174,7 @@ impl Default for TestValidatorGenesis {
             max_ledger_shreds: Option::<u64>::default(),
             max_genesis_archive_unpacked_size: Option::<u64>::default(),
             geyser_plugin_config_files: Option::<Vec<PathBuf>>::default(),
+            enable_scheduler_bindings: false,
             deactivate_feature_set,
             compute_unit_limit: Option::<u64>::default(),
             log_messages_bytes_limit: Option::<usize>::default(),
@@ -1033,6 +1039,7 @@ impl TestValidator {
                 gossip_port: config.node_config.gossip_addr.port(),
                 port_range: config.node_config.port_range,
                 advertised_ip: bind_ip_addr,
+                public_tvu_addr: None,
                 public_tpu_addr: None,
                 public_tpu_forwards_addr: None,
                 num_tvu_receive_sockets: NonZero::new(1).unwrap(),
@@ -1087,6 +1094,9 @@ impl TestValidator {
                         !config
                             .deactivate_feature_set
                             .contains(&raise_cpi_nesting_limit_to_8::id()),
+                        !config
+                            .deactivate_feature_set
+                            .contains(&increase_cpi_account_info_limit::id()),
                     )
                 }),
             log_messages_bytes_limit: config.log_messages_bytes_limit,
@@ -1130,6 +1140,7 @@ impl TestValidator {
             staked_nodes_overrides: config.staked_nodes_overrides.clone(),
             accounts_db_config,
             runtime_config,
+            enable_scheduler_bindings: config.enable_scheduler_bindings,
             ..ValidatorConfig::default_for_test()
         };
         if let Some(ref tower_storage) = config.tower_storage {
@@ -1214,7 +1225,7 @@ impl TestValidator {
     }
 
     /// programs added to genesis ain't immediately usable. Actively check "Program
-    /// is not deployed" error for their availibility.
+    /// is not deployed" error for their availability.
     async fn wait_for_upgradeable_programs_deployed(
         &self,
         upgradeable_programs: &[&Pubkey],
@@ -1491,10 +1502,10 @@ mod test {
 
         // The first one, where we provided `--deactivate-feature`, should be
         // the account we provided.
-        let overriden_account = our_accounts[0].as_ref().unwrap();
-        assert_eq!(overriden_account.lamports, 100_000);
-        assert_eq!(overriden_account.data.len(), 0);
-        assert_eq!(overriden_account.owner, owner);
+        let overridden_account = our_accounts[0].as_ref().unwrap();
+        assert_eq!(overridden_account.lamports, 100_000);
+        assert_eq!(overridden_account.data.len(), 0);
+        assert_eq!(overridden_account.owner, owner);
 
         // The second one should be a feature account.
         let feature_account = our_accounts[1].as_ref().unwrap();

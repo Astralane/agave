@@ -12,11 +12,11 @@ use {
     solana_hash::Hash,
     solana_keypair::{keypair_from_seed, Keypair},
     solana_native_token::LAMPORTS_PER_SOL,
+    solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_nonce_utils::blockhash_query::{self, BlockhashQuery},
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_system_interface::program as system_program,
     solana_test_validator::TestValidator,
     test_case::test_case,
@@ -215,7 +215,7 @@ fn test_nonce(seed: Option<String>, use_nonce_authority: bool, compute_unit_pric
 #[test]
 fn test_create_account_with_seed() {
     const ONE_SIG_FEE: u64 = 5000;
-    solana_logger::setup();
+    agave_logger::setup();
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair);

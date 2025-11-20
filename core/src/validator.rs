@@ -21,24 +21,21 @@ use {
             repair_handler::RepairHandlerType,
             serve_repair_service::ServeRepairService,
         },
-        resource_limits::{adjust_nofile_limit, ResourceLimitError},
+        resource_limits::{
+            adjust_nofile_limit, validate_memlock_limit_for_disk_io, ResourceLimitError,
+        },
         sample_performance_service::SamplePerformanceService,
-        sigverify,
         snapshot_packager_service::SnapshotPackagerService,
         stats_reporter_service::StatsReporterService,
         system_monitor_service::{
             verify_net_stats_access, SystemMonitorService, SystemMonitorStatsReportConfig,
         },
-        tpu::{ForwardingClientOption, Tpu, TpuSockets, DEFAULT_TPU_COALESCE},
+        tpu::{ForwardingClientOption, Tpu, TpuSockets},
         tvu::{Tvu, TvuConfig, TvuSockets},
     },
     agave_snapshots::{
-        hardened_unpack::{
-            open_genesis_config, OpenGenesisConfigError, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
-        },
-        snapshot_config::SnapshotConfig,
-        snapshot_hash::StartingSnapshotHashes,
-        SnapshotInterval,
+        snapshot_archive_info::SnapshotArchiveInfoGetter as _, snapshot_config::SnapshotConfig,
+        snapshot_hash::StartingSnapshotHashes, SnapshotInterval,
     },
     anyhow::{anyhow, Context, Result},
     crossbeam_channel::{bounded, unbounded, Receiver},
@@ -59,6 +56,9 @@ use {
     solana_entry::poh::compute_hash_time,
     solana_epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
     solana_genesis_config::GenesisConfig,
+    solana_genesis_utils::{
+        open_genesis_config, OpenGenesisConfigError, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+    },
     solana_geyser_plugin_manager::{
         geyser_plugin_service::GeyserPluginService, GeyserPluginManagerRequest,
     },
@@ -92,6 +92,7 @@ use {
     },
     solana_measure::measure::Measure,
     solana_metrics::{datapoint_info, metrics::metrics_config_sanity_check},
+    solana_net_utils::SocketAddrSpace,
     solana_poh::{
         poh_controller::PohController,
         poh_recorder::PohRecorder,
@@ -126,7 +127,6 @@ use {
         dependency_tracker::DependencyTracker,
         prioritization_fee_cache::PrioritizationFeeCache,
         runtime_config::RuntimeConfig,
-        snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_bank_utils,
         snapshot_controller::SnapshotController,
         snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
@@ -134,15 +134,17 @@ use {
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_shred_version::compute_shred_version,
     solana_signer::Signer,
-    solana_streamer::{quic::QuicServerParams, socket::SocketAddrSpace, streamer::StakedNodes},
-    solana_time_utils::timestamp,
-    solana_tpu_client::tpu_client::{
-        DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_TPU_USE_QUIC, DEFAULT_VOTE_USE_QUIC,
+    solana_streamer::{
+        nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
+        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
+        streamer::StakedNodes,
     },
+    solana_time_utils::timestamp,
+    solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
     solana_turbine::{
         self,
         broadcast_stage::BroadcastStageType,
-        xdp::{XdpConfig, XdpRetransmitter},
+        xdp::{master_ip_if_bonded, XdpConfig, XdpRetransmitter},
     },
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_validator_exit::Exit,
@@ -151,7 +153,7 @@ use {
     std::{
         borrow::Cow,
         collections::{HashMap, HashSet},
-        net::SocketAddr,
+        net::{IpAddr, SocketAddr},
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,
@@ -159,13 +161,13 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex, RwLock,
         },
-        thread::{sleep, Builder, JoinHandle},
+        thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
     strum::VariantNames,
     strum_macros::{Display, EnumCount, EnumIter, EnumString, EnumVariantNames, IntoStaticStr},
     thiserror::Error,
-    tokio::runtime::Runtime as TokioRuntime,
+    tokio::{runtime::Runtime as TokioRuntime, sync::mpsc},
     tokio_util::sync::CancellationToken,
 };
 
@@ -303,6 +305,8 @@ pub struct GeneratorConfig {
 }
 
 pub struct ValidatorConfig {
+    /// The destination file for validator logs; `stderr` is used if `None`
+    pub logfile: Option<PathBuf>,
     pub halt_at_slot: Option<Slot>,
     pub expected_genesis_hash: Option<Hash>,
     pub expected_bank_hash: Option<Hash>,
@@ -329,7 +333,7 @@ pub struct ValidatorConfig {
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>, // Empty = repair with all
     pub gossip_validators: Option<HashSet<Pubkey>>, // None = gossip with all
     pub max_genesis_archive_unpacked_size: u64,
-    /// Run PoH, transaction signature and other transaction verifications during blockstore
+    /// Run PoH, transaction signature and other transaction verification during blockstore
     /// processing.
     pub run_verification: bool,
     pub require_tower: bool,
@@ -351,7 +355,6 @@ pub struct ValidatorConfig {
     pub warp_slot: Option<Slot>,
     pub accounts_db_skip_shrink: bool,
     pub accounts_db_force_initial_clean: bool,
-    pub tpu_coalesce: Duration,
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub validator_exit: Arc<RwLock<Exit>>,
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
@@ -364,6 +367,7 @@ pub struct ValidatorConfig {
     pub block_production_num_workers: NonZeroUsize,
     pub block_production_scheduler_config: SchedulerConfig,
     pub enable_block_production_forwarding: bool,
+    pub enable_scheduler_bindings: bool,
     pub generator_config: Option<GeneratorConfig>,
     pub use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup,
     pub wen_restart_proto_path: Option<PathBuf>,
@@ -375,7 +379,6 @@ pub struct ValidatorConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub tvu_shred_sigverify_threads: NonZeroUsize,
     pub delay_leader_block_for_pending_fork: bool,
-    pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
 }
@@ -386,6 +389,7 @@ impl ValidatorConfig {
             NonZeroUsize::new(num_cpus::get()).expect("thread count is non-zero");
 
         Self {
+            logfile: None,
             halt_at_slot: None,
             expected_genesis_hash: None,
             expected_bank_hash: None,
@@ -431,7 +435,6 @@ impl ValidatorConfig {
             warp_slot: None,
             accounts_db_skip_shrink: false,
             accounts_db_force_initial_clean: false,
-            tpu_coalesce: DEFAULT_TPU_COALESCE,
             staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
@@ -446,6 +449,7 @@ impl ValidatorConfig {
             block_production_scheduler_config: SchedulerConfig::default(),
             // enable forwarding by default for tests
             enable_block_production_forwarding: true,
+            enable_scheduler_bindings: false,
             generator_config: None,
             use_snapshot_archives_at_startup: UseSnapshotArchivesAtStartup::default(),
             wen_restart_proto_path: None,
@@ -458,7 +462,6 @@ impl ValidatorConfig {
             tvu_shred_sigverify_threads: NonZeroUsize::new(get_thread_count())
                 .expect("thread count is non-zero"),
             delay_leader_block_for_pending_fork: false,
-            use_tpu_client_next: true,
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
         }
@@ -482,8 +485,9 @@ impl ValidatorConfig {
 // `ValidatorStartProgress` contains status information that is surfaced to the node operator over
 // the admin RPC channel to help them to follow the general progress of node startup without
 // having to watch log messages.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ValidatorStartProgress {
+    #[default]
     Initializing, // Catch all, default state
     SearchingForRpcService,
     DownloadingSnapshot {
@@ -507,12 +511,6 @@ pub enum ValidatorStartProgress {
     // `Running` is the terminal state once the validator fully starts and all services are
     // operational
     Running,
-}
-
-impl Default for ValidatorStartProgress {
-    fn default() -> Self {
-        Self::Initializing
-    }
 }
 
 struct BlockstoreRootScan {
@@ -555,44 +553,53 @@ struct TransactionHistoryServices {
 
 /// A struct easing passing Validator TPU Configurations
 pub struct ValidatorTpuConfig {
-    /// Controls if to use QUIC for sending regular TPU transaction
-    pub use_quic: bool,
     /// Controls if to use QUIC for sending TPU votes
     pub vote_use_quic: bool,
     /// Controls the connection cache pool size
     pub tpu_connection_pool_size: usize,
-    /// Controls if to enable UDP for TPU tansactions.
+    /// Controls if to enable UDP for TPU transactions.
     pub tpu_enable_udp: bool,
     /// QUIC server config for regular TPU
-    pub tpu_quic_server_config: QuicServerParams,
+    pub tpu_quic_server_config: SwQosQuicStreamerConfig,
     /// QUIC server config for TPU forward
-    pub tpu_fwd_quic_server_config: QuicServerParams,
+    pub tpu_fwd_quic_server_config: SwQosQuicStreamerConfig,
     /// QUIC server config for Vote
-    pub vote_quic_server_config: QuicServerParams,
+    pub vote_quic_server_config: SimpleQosQuicStreamerConfig,
 }
 
 impl ValidatorTpuConfig {
     /// A convenient function to build a ValidatorTpuConfig for testing with good
     /// default.
     pub fn new_for_tests(tpu_enable_udp: bool) -> Self {
-        let tpu_quic_server_config = QuicServerParams {
-            max_connections_per_ipaddr_per_min: 32,
-            coalesce_channel_size: 100_000, // smaller channel size for faster test
-            ..Default::default()
+        let tpu_quic_server_config = SwQosQuicStreamerConfig {
+            quic_streamer_config: QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: 32,
+                ..Default::default()
+            },
+            qos_config: SwQosConfig::default(),
         };
 
-        let tpu_fwd_quic_server_config = QuicServerParams {
-            max_connections_per_ipaddr_per_min: 32,
-            max_unstaked_connections: 0,
-            coalesce_channel_size: 100_000, // smaller channel size for faster test
-            ..Default::default()
+        let tpu_fwd_quic_server_config = SwQosQuicStreamerConfig {
+            quic_streamer_config: QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: 32,
+                ..Default::default()
+            },
+            qos_config: SwQosConfig {
+                max_unstaked_connections: 0,
+                ..Default::default()
+            },
         };
 
         // vote and tpu_fwd share the same characteristics -- disallow non-staked connections:
-        let vote_quic_server_config = tpu_fwd_quic_server_config.clone();
+        let vote_quic_server_config = SimpleQosQuicStreamerConfig {
+            quic_streamer_config: QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: 32,
+                ..Default::default()
+            },
+            qos_config: SimpleQosConfig::default(),
+        };
 
         ValidatorTpuConfig {
-            use_quic: DEFAULT_TPU_USE_QUIC,
             vote_use_quic: DEFAULT_VOTE_USE_QUIC,
             tpu_connection_pool_size: DEFAULT_TPU_CONNECTION_POOL_SIZE,
             tpu_enable_udp,
@@ -604,6 +611,11 @@ impl ValidatorTpuConfig {
 }
 
 pub struct Validator {
+    /// The destination file for validator logs; `stderr` is used if `None`
+    #[cfg_attr(not(unix), allow(dead_code))]
+    logfile: Option<PathBuf>,
+    /// A global flag to indicate communicate shutdown between threads
+    exit: Arc<AtomicBool>,
     validator_exit: Arc<RwLock<Exit>>,
     json_rpc_service: Option<JsonRpcService>,
     pubsub_service: Option<PubSubService>,
@@ -666,7 +678,6 @@ impl Validator {
         info!("debug-assertion status: {DEBUG_ASSERTION_STATUS}");
 
         let ValidatorTpuConfig {
-            use_quic,
             vote_use_quic,
             tpu_connection_pool_size,
             tpu_enable_udp,
@@ -750,17 +761,7 @@ impl Validator {
             info!("entrypoint: {cluster_entrypoint:?}");
         }
 
-        if solana_perf::perf_libs::api().is_some() {
-            info!("Initializing sigverify, this could take a while...");
-        } else {
-            info!("Initializing sigverify...");
-        }
-        sigverify::init();
-        info!("Initializing sigverify done.");
-
-        solana_accounts_db::validate_memlock_limit_for_disk_io(
-            config.accounts_db_config.memlock_budget_size,
-        )?;
+        validate_memlock_limit_for_disk_io(config.accounts_db_config.memlock_budget_size)?;
 
         if !ledger_path.is_dir() {
             return Err(anyhow!(
@@ -1121,38 +1122,6 @@ impl Validator {
 
         let mut tpu_transactions_forwards_client_sockets =
             Some(node.sockets.tpu_transaction_forwarding_clients);
-        let connection_cache = match (config.use_tpu_client_next, use_quic) {
-            (false, true) => Some(Arc::new(ConnectionCache::new_with_client_options(
-                "connection_cache_tpu_quic",
-                tpu_connection_pool_size,
-                Some({
-                    // this conversion is not beautiful but rust does not allow popping single
-                    // elements from a boxed slice
-                    let socketbox: Box<[_; 1]> = tpu_transactions_forwards_client_sockets
-                        .take()
-                        .unwrap()
-                        .try_into()
-                        .expect("Multihoming support for connection cache is not available");
-                    let [sock] = *socketbox;
-                    sock
-                }),
-                Some((
-                    &identity_keypair,
-                    node.info
-                        .tpu(Protocol::UDP)
-                        .ok_or_else(|| {
-                            ValidatorError::Other(String::from("Invalid UDP address for TPU"))
-                        })?
-                        .ip(),
-                )),
-                Some((&staked_nodes, &identity_keypair.pubkey())),
-            ))),
-            (false, false) => Some(Arc::new(ConnectionCache::with_udp(
-                "connection_cache_tpu_udp",
-                tpu_connection_pool_size,
-            ))),
-            (true, _) => None,
-        };
 
         let vote_connection_cache = if vote_use_quic {
             let vote_connection_cache = ConnectionCache::new_with_client_options(
@@ -1184,15 +1153,14 @@ impl Validator {
         // always need a tokio runtime (and the respective handle) to initialize
         // the turbine QUIC endpoint.
         let current_runtime_handle = tokio::runtime::Handle::try_current();
-        let tpu_client_next_runtime =
-            (current_runtime_handle.is_err() && config.use_tpu_client_next).then(|| {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .worker_threads(2)
-                    .thread_name("solTpuClientRt")
-                    .build()
-                    .unwrap()
-            });
+        let tpu_client_next_runtime = current_runtime_handle.is_err().then(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .thread_name("solTpuClientRt")
+                .build()
+                .unwrap()
+        });
 
         let rpc_override_health_check =
             Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
@@ -1219,7 +1187,7 @@ impl Validator {
                 None
             };
 
-            let client_option = if config.use_tpu_client_next {
+            let client_option = {
                 let runtime_handle = tpu_client_next_runtime
                     .as_ref()
                     .map(TokioRuntime::handle)
@@ -1230,11 +1198,6 @@ impl Validator {
                     runtime_handle.clone(),
                     cancel.clone(),
                 )
-            } else {
-                let Some(connection_cache) = &connection_cache else {
-                    panic!("ConnectionCache should exist by construction.");
-                };
-                ClientOption::ConnectionCache(connection_cache.clone())
             };
             let rpc_svc_config = JsonRpcServiceConfig {
                 rpc_addr,
@@ -1556,20 +1519,21 @@ impl Validator {
             )
         });
 
-        // If RPC is supported and ConnectionCache is used, pass ConnectionCache for being warmup inside Tvu.
-        let connection_cache_for_warmup =
-            if json_rpc_service.is_some() && connection_cache.is_some() {
-                connection_cache.as_ref()
-            } else {
-                None
-            };
         let (xdp_retransmitter, xdp_sender) =
             if let Some(xdp_config) = config.retransmit_xdp.clone() {
                 let src_port = node.sockets.retransmit_sockets[0]
                     .local_addr()
                     .expect("failed to get local address")
                     .port();
-                let (rtx, sender) = XdpRetransmitter::new(xdp_config, src_port)
+                let src_ip = match node.bind_ip_addrs.active() {
+                    IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+                    IpAddr::V4(_unspecified) => xdp_config
+                        .interface
+                        .as_ref()
+                        .and_then(|iface| master_ip_if_bonded(iface)),
+                    _ => panic!("IPv6 not supported"),
+                };
+                let (rtx, sender) = XdpRetransmitter::new(xdp_config, src_port, src_ip)
                     .expect("failed to create xdp retransmitter");
                 (Some(rtx), Some(sender))
             } else {
@@ -1634,7 +1598,6 @@ impl Validator {
             config.wait_to_vote_slot,
             Some(snapshot_controller.clone()),
             config.runtime_config.log_messages_bytes_limit,
-            connection_cache_for_warmup,
             &prioritization_fee_cache,
             banking_tracer.clone(),
             turbine_quic_endpoint_sender.clone(),
@@ -1672,9 +1635,7 @@ impl Validator {
         }
 
         let key_notifiers = Arc::new(RwLock::new(KeyUpdaters::default()));
-        let forwarding_tpu_client = if let Some(connection_cache) = &connection_cache {
-            ForwardingClientOption::ConnectionCache(connection_cache.clone())
-        } else {
+        let forwarding_tpu_client = {
             let runtime_handle = tpu_client_next_runtime
                 .as_ref()
                 .map(TokioRuntime::handle)
@@ -1687,6 +1648,7 @@ impl Validator {
                 node_multihoming.clone(),
             ))
         };
+        let (banking_control_sender, banking_control_reciever) = mpsc::channel(1);
         let tpu = Tpu::new_with_client(
             &cluster_info,
             &poh_recorder,
@@ -1710,7 +1672,7 @@ impl Validator {
             blockstore.clone(),
             &config.broadcast_stage_type,
             xdp_sender,
-            exit,
+            exit.clone(),
             node.info.shred_version(),
             vote_tracker,
             bank_forks.clone(),
@@ -1719,7 +1681,6 @@ impl Validator {
             replay_vote_receiver,
             replay_vote_sender,
             bank_notification_sender,
-            config.tpu_coalesce,
             duplicate_confirmed_slot_sender,
             forwarding_tpu_client,
             turbine_quic_endpoint_sender,
@@ -1740,6 +1701,13 @@ impl Validator {
             config.enable_block_production_forwarding,
             config.generator_config.clone(),
             key_notifiers.clone(),
+            banking_control_reciever,
+            config.enable_scheduler_bindings.then(|| {
+                (
+                    ledger_path.join("scheduler_bindings.ipc"),
+                    banking_control_sender.clone(),
+                )
+            }),
             cancel,
         );
 
@@ -1754,15 +1722,11 @@ impl Validator {
         );
 
         *start_progress.write().unwrap() = ValidatorStartProgress::Running;
-        if config.use_tpu_client_next {
-            if let Some(json_rpc_service) = &json_rpc_service {
-                key_notifiers.write().unwrap().add(
-                    KeyUpdaterType::RpcService,
-                    json_rpc_service.get_client_key_updater(),
-                );
-            }
-            // note, that we don't need to add ConnectionClient to key_notifiers
-            // because it is added inside Tpu.
+        if let Some(json_rpc_service) = &json_rpc_service {
+            key_notifiers.write().unwrap().add(
+                KeyUpdaterType::RpcService,
+                json_rpc_service.get_client_key_updater(),
+            );
         }
 
         *admin_rpc_service_post_init.write().unwrap() = Some(AdminRpcRequestMetadataPostInit {
@@ -1775,10 +1739,12 @@ impl Validator {
             outstanding_repair_requests,
             cluster_slots,
             node: Some(node_multihoming),
-            banking_stage: tpu.banking_stage(),
+            banking_control_sender,
         });
 
         Ok(Self {
+            logfile: config.logfile.clone(),
+            exit,
             stats_reporter_service,
             gossip_service,
             serve_repair_service,
@@ -1813,6 +1779,53 @@ impl Validator {
             xdp_retransmitter,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })
+    }
+
+    /// Register and listen for signals that the validator will act on. Also,
+    /// monitor the validator's exit flag incase a shutdown has been initated
+    /// by one of the validator threads
+    pub fn listen_for_signals(&self) -> Result<()> {
+        // Reopen the logfile when the SIGUSR1 signal is received; this provides
+        // a hook for working with logrotate
+        let sigusr1_flag = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        {
+            if self.logfile.is_some() {
+                signal_hook::flag::register(libc::SIGUSR1, sigusr1_flag.clone())?;
+            }
+        }
+
+        info!("Validator::listen_for_signals() has started");
+        loop {
+            if self.exit.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if sigusr1_flag.load(Ordering::Relaxed) {
+                #[cfg(unix)]
+                {
+                    if let Some(logfile) = self.logfile.as_ref() {
+                        info!("Received SIGUSR1, reopening {}", logfile.display());
+                        agave_logger::redirect_stderr(logfile);
+                        // Reset the flag to `false` to allow detection of the
+                        // signal again and to avoid hitting this case every
+                        // iteration
+                        sigusr1_flag.store(false, Ordering::Relaxed);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    unreachable!("The SIGUSR1 signal is only handled on unix systems");
+                }
+            }
+
+            // One second is a reasonable response time for these signals to
+            // avoid this thread from being overly active
+            thread::sleep(Duration::from_secs(1));
+        }
+        info!("Validator::listen_for_signals() has stopped");
+
+        Ok(())
     }
 
     // Used for notifying many nodes in parallel to exit
@@ -2316,7 +2329,7 @@ impl<'a> ProcessBlockStore<'a> {
                             let slot = bank_forks.read().unwrap().working_bank().slot();
                             *start_progress.write().unwrap() =
                                 ValidatorStartProgress::ProcessingLedger { slot, max_slot };
-                            sleep(Duration::from_secs(2));
+                            thread::sleep(Duration::from_secs(2));
                         }
                     })
                     .unwrap();
@@ -2753,7 +2766,7 @@ fn wait_for_supermajority(
                 // prevent load balancers from removing the node from their list of candidates during a
                 // manual restart.
                 rpc_override_health_check.store(true, Ordering::Relaxed);
-                sleep(Duration::new(1, 0));
+                thread::sleep(Duration::new(1, 0));
             }
             rpc_override_health_check.store(false, Ordering::Relaxed);
             Ok(true)
@@ -2905,7 +2918,7 @@ mod tests {
 
     #[test]
     fn validator_exit() {
-        solana_logger::setup();
+        agave_logger::setup();
         let leader_keypair = Keypair::new();
         let leader_node = Node::new_localhost_with_pubkey(&leader_keypair.pubkey());
 
@@ -2951,7 +2964,7 @@ mod tests {
 
     #[test]
     fn test_should_cleanup_blockstore_incorrect_shred_versions() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
@@ -3086,7 +3099,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_blockstore_incorrect_shred_versions() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let validator_config = ValidatorConfig::default_for_test();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
@@ -3182,7 +3195,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_supermajority() {
-        solana_logger::setup();
+        agave_logger::setup();
         let node_keypair = Arc::new(Keypair::new());
         let cluster_info = ClusterInfo::new(
             ContactInfo::new_localhost(&node_keypair.pubkey(), timestamp()),
@@ -3329,7 +3342,7 @@ mod tests {
 
     #[test]
     fn test_poh_speed() {
-        solana_logger::setup();
+        agave_logger::setup();
         let poh_config = PohConfig {
             target_tick_duration: target_tick_duration(),
             // make PoH rate really fast to cause the panic condition
@@ -3346,7 +3359,7 @@ mod tests {
 
     #[test]
     fn test_poh_speed_no_hashes_per_tick() {
-        solana_logger::setup();
+        agave_logger::setup();
         let poh_config = PohConfig {
             target_tick_duration: target_tick_duration(),
             hashes_per_tick: None,

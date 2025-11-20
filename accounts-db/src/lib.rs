@@ -20,7 +20,6 @@ pub mod accounts_db;
 pub mod accounts_file;
 pub mod accounts_hash;
 pub mod accounts_index;
-pub mod accounts_index_storage;
 pub mod accounts_update_notifier_interface;
 mod active_stats;
 pub mod ancestors;
@@ -30,12 +29,7 @@ pub mod append_vec;
 #[cfg(not(feature = "dev-context-only-utils"))]
 mod append_vec;
 pub mod blockhash_queue;
-mod bucket_map_holder;
-mod bucket_map_holder_stats;
-mod buffered_reader;
 pub mod contains;
-mod file_io;
-mod io_uring;
 pub mod is_loadable;
 mod is_zero_lamport;
 mod obsolete_accounts;
@@ -53,13 +47,7 @@ pub mod tiered_storage;
 pub mod utils;
 pub mod waitable_condvar;
 
-pub use {
-    buffered_reader::large_file_buf_reader,
-    file_io::{
-        file_creator, set_path_permissions, validate_memlock_limit_for_disk_io, FileCreator,
-    },
-    obsolete_accounts::{ObsoleteAccountItem, ObsoleteAccounts},
-};
+pub use obsolete_accounts::{ObsoleteAccountItem, ObsoleteAccounts};
 
 #[macro_use]
 extern crate solana_metrics;

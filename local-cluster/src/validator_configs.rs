@@ -6,6 +6,7 @@ use {
 
 pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
     ValidatorConfig {
+        logfile: config.logfile.clone(),
         halt_at_slot: config.halt_at_slot,
         expected_genesis_hash: config.expected_genesis_hash,
         expected_bank_hash: config.expected_bank_hash,
@@ -48,7 +49,6 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         warp_slot: config.warp_slot,
         accounts_db_skip_shrink: config.accounts_db_skip_shrink,
         accounts_db_force_initial_clean: config.accounts_db_force_initial_clean,
-        tpu_coalesce: config.tpu_coalesce,
         staked_nodes_overrides: config.staked_nodes_overrides.clone(),
         validator_exit: Arc::new(RwLock::new(Exit::default())),
         validator_exit_backpressure: config
@@ -68,6 +68,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         block_production_num_workers: config.block_production_num_workers,
         block_production_scheduler_config: config.block_production_scheduler_config.clone(),
         enable_block_production_forwarding: config.enable_block_production_forwarding,
+        enable_scheduler_bindings: config.enable_scheduler_bindings,
         generator_config: config.generator_config.clone(),
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         wen_restart_proto_path: config.wen_restart_proto_path.clone(),
@@ -79,7 +80,6 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         replay_transactions_threads: config.replay_transactions_threads,
         tvu_shred_sigverify_threads: config.tvu_shred_sigverify_threads,
         delay_leader_block_for_pending_fork: config.delay_leader_block_for_pending_fork,
-        use_tpu_client_next: config.use_tpu_client_next,
         retransmit_xdp: config.retransmit_xdp.clone(),
         repair_handler_type: config.repair_handler_type.clone(),
     }

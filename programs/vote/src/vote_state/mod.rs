@@ -18,7 +18,10 @@ use {
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_slot_hashes::SlotHash,
-    solana_transaction_context::{BorrowedInstructionAccount, IndexOfAccount, InstructionContext},
+    solana_transaction_context::{
+        instruction::InstructionContext, instruction_accounts::BorrowedInstructionAccount,
+        IndexOfAccount,
+    },
     solana_vote_interface::{error::VoteError, program::id},
     std::{
         cmp::Ordering,
@@ -1060,10 +1063,7 @@ fn do_process_tower_sync(
     )
 }
 
-// This function is used:
-// a. In many tests.
-// b. In the genesis tool that initializes a cluster to create the bootstrap validator.
-// c. In the ledger tool when creating bootstrap vote accounts.
+#[cfg(test)]
 pub fn create_account_with_authorized(
     node_pubkey: &Pubkey,
     authorized_voter: &Pubkey,
@@ -1119,16 +1119,6 @@ pub fn create_v4_account_with_authorized(
     vote_account
 }
 
-// create_account() should be removed, use create_account_with_authorized() instead
-pub fn create_account(
-    vote_pubkey: &Pubkey,
-    node_pubkey: &Pubkey,
-    commission: u8,
-    lamports: u64,
-) -> AccountSharedData {
-    create_account_with_authorized(node_pubkey, vote_pubkey, vote_pubkey, commission, lamports)
-}
-
 #[allow(clippy::arithmetic_side_effects)]
 #[cfg(test)]
 mod tests {
@@ -1138,7 +1128,9 @@ mod tests {
         solana_account::{AccountSharedData, ReadableAccount},
         solana_clock::DEFAULT_SLOTS_PER_EPOCH,
         solana_sha256_hasher::hash,
-        solana_transaction_context::{InstructionAccount, TransactionContext},
+        solana_transaction_context::{
+            instruction_accounts::InstructionAccount, TransactionContext,
+        },
         solana_vote_interface::authorized_voters::AuthorizedVoters,
         test_case::test_case,
     };

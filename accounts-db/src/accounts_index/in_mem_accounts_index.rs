@@ -1,17 +1,14 @@
 use {
-    crate::{
-        accounts_index::{
-            account_map_entry::{
-                AccountMapEntry, AccountMapEntryMeta, PreAllocatedAccountMapEntry,
-                SlotListWriteGuard,
-            },
-            DiskIndexValue, IndexValue, ReclaimsSlotList, RefCount, SlotList, UpsertReclaim,
+    super::{
+        account_map_entry::{
+            AccountMapEntry, AccountMapEntryMeta, PreAllocatedAccountMapEntry, SlotListWriteGuard,
         },
         bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
-        bucket_map_holder_stats::BucketMapHolderStats,
-        pubkey_bins::PubkeyBinCalculator24,
+        stats::Stats,
+        DiskIndexValue, IndexValue, ReclaimsSlotList, RefCount, SlotList, UpsertReclaim,
     },
-    rand::{thread_rng, Rng},
+    crate::pubkey_bins::PubkeyBinCalculator24,
+    rand::{rng, Rng},
     solana_bucket_map::bucket_api::BucketApi,
     solana_clock::Slot,
     solana_measure::measure::Measure,
@@ -33,61 +30,12 @@ pub struct StartupStats {
     pub copy_data_us: AtomicU64,
 }
 
-#[derive(Debug)]
-pub struct PossibleEvictions<T: IndexValue> {
-    /// vec per age in the future, up to size 'ages_to_stay_in_cache'
-    possible_evictions: Vec<FlushScanResult<T>>,
-    /// next index to use into 'possible_evictions'
-    /// if 'index' >= 'possible_evictions.len()', then there are no available entries
-    index: usize,
-}
-
-impl<T: IndexValue> PossibleEvictions<T> {
-    fn new(max_ages: Age) -> Self {
-        Self {
-            possible_evictions: (0..max_ages).map(|_| FlushScanResult::default()).collect(),
-            index: max_ages as usize, // initially no data
-        }
-    }
-
-    /// remove the possible evictions. This is required because we need ownership of the Arc strong counts to transfer to caller so entries can be removed from the accounts index
-    fn get_possible_evictions(&mut self) -> Option<FlushScanResult<T>> {
-        self.possible_evictions.get_mut(self.index).map(|result| {
-            self.index += 1;
-            // remove the list from 'possible_evictions'
-            std::mem::take(result)
-        })
-    }
-
-    /// clear existing data and prepare to add 'entries' more ages of data
-    fn reset(&mut self, entries: Age) {
-        self.possible_evictions.iter_mut().for_each(|entry| {
-            entry.evictions_age_possible.clear();
-        });
-        let entries = entries as usize;
-        assert!(
-            entries <= self.possible_evictions.len(),
-            "entries: {}, len: {}",
-            entries,
-            self.possible_evictions.len()
-        );
-        self.index = self.possible_evictions.len() - entries;
-    }
-
-    /// insert 'entry' at 'relative_age' in the future into 'possible_evictions'
-    fn insert(&mut self, relative_age: Age, key: Pubkey, entry: Arc<AccountMapEntry<T>>) {
-        let index = self.index + (relative_age as usize);
-        let list = &mut self.possible_evictions[index];
-        list.evictions_age_possible.push((key, entry));
-    }
-}
-
 // one instance of this represents one bin of the accounts index.
 pub struct InMemAccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     last_age_flushed: AtomicAge,
 
     // backing store
-    map_internal: RwLock<HashMap<Pubkey, Arc<AccountMapEntry<T>>, ahash::RandomState>>,
+    map_internal: RwLock<HashMap<Pubkey, Box<AccountMapEntry<T>>, ahash::RandomState>>,
     storage: Arc<BucketMapHolder<T, U>>,
     _bin: usize,
     pub(crate) lowest_pubkey: Pubkey,
@@ -100,9 +48,6 @@ pub struct InMemAccountsIndex<T: IndexValue, U: DiskIndexValue + From<T> + Into<
 
     /// info to streamline initial index generation
     startup_info: StartupInfo<T, U>,
-
-    /// possible evictions for next few slots coming up
-    possible_evictions: RwLock<PossibleEvictions<T>>,
 
     /// how many more ages to skip before this bucket is flushed (as opposed to being skipped).
     /// When this reaches 0, this bucket is flushed.
@@ -162,21 +107,29 @@ struct StartupInfo<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     duplicates: Mutex<StartupInfoDuplicates<T>>,
 }
 
-#[derive(Default, Debug)]
-/// result from scanning in-mem index during flush
-struct FlushScanResult<T> {
-    /// pubkeys whose age indicates they may be evicted now, pending further checks.
-    evictions_age_possible: Vec<(Pubkey, Arc<AccountMapEntry<T>>)>,
-}
-
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T, U> {
-    pub fn new(storage: &Arc<BucketMapHolder<T, U>>, bin: usize) -> Self {
+    pub fn new(
+        storage: &Arc<BucketMapHolder<T, U>>,
+        bin: usize,
+        num_initial_accounts: Option<usize>,
+    ) -> Self {
         let num_ages_to_distribute_flushes = Age::MAX - storage.ages_to_stay_in_cache;
         let bin_calc = PubkeyBinCalculator24::new(storage.bins);
         let lowest_pubkey = bin_calc.lowest_pubkey_from_bin(bin);
         let highest_pubkey = bin_calc.highest_pubkey_from_bin(bin);
+
+        let map_internal = if let Some(num_initial_accounts) = num_initial_accounts {
+            let capacity_per_bin = num_initial_accounts / storage.bins;
+            RwLock::new(HashMap::with_capacity_and_hasher(
+                capacity_per_bin,
+                ahash::RandomState::default(),
+            ))
+        } else {
+            RwLock::default()
+        };
+
         Self {
-            map_internal: RwLock::default(),
+            map_internal,
             storage: Arc::clone(storage),
             _bin: bin,
             lowest_pubkey,
@@ -190,11 +143,10 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             // initialize this to max, to make it clear we have not flushed at age 0, the starting age
             last_age_flushed: AtomicAge::new(Age::MAX),
             startup_info: StartupInfo::default(),
-            possible_evictions: RwLock::new(PossibleEvictions::new(1)),
             // Spread out the scanning across all ages within the window.
             // This causes us to scan 1/N of the bins each 'Age'
             remaining_ages_to_skip_flushing: AtomicAge::new(
-                thread_rng().gen_range(0..num_ages_to_distribute_flushes),
+                rng().random_range(0..num_ages_to_distribute_flushes),
             ),
             num_ages_to_distribute_flushes,
             startup_stats: Arc::clone(&storage.startup_stats),
@@ -216,16 +168,6 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
 
     fn last_age_flushed(&self) -> Age {
         self.last_age_flushed.load(Ordering::Acquire)
-    }
-
-    /// Release entire in-mem hashmap to free all memory associated with it.
-    /// Idea is that during startup we needed a larger map than we need during runtime.
-    /// When using disk-buckets, in-mem index grows over time with dynamic use and then shrinks, in theory back to 0.
-    pub fn shrink_to_fit(&self) {
-        // shrink_to_fit could be quite expensive on large map sizes, which 'no disk buckets' could produce, so avoid shrinking in case we end up here
-        if self.storage.is_disk_index_enabled() {
-            self.map_internal.write().unwrap().shrink_to_fit();
-        }
     }
 
     /// return all keys in this bin
@@ -356,7 +298,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                         // If the entry is now dirty, then it must be put in the cache or the modifications will be lost.
                         if add_to_cache || disk_entry.dirty() {
                             stats.inc_mem_count();
-                            vacant.insert(Arc::new(disk_entry));
+                            vacant.insert(Box::new(disk_entry));
                         }
                         rt
                     }
@@ -388,7 +330,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     /// return true in all other cases, including if the entry is NOT in the index at all
     fn remove_if_slot_list_empty_entry(
         &self,
-        entry: Entry<Pubkey, Arc<AccountMapEntry<T>>>,
+        entry: Entry<Pubkey, Box<AccountMapEntry<T>>>,
     ) -> bool {
         match entry {
             Entry::Occupied(occupied) => {
@@ -562,7 +504,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                             "Callback must insert item into slot list"
                         );
                         assert!(new_value.dirty());
-                        vacant.insert(Arc::new(new_value));
+                        vacant.insert(Box::new(new_value));
                         stats.inc_mem_count();
                     }
                 };
@@ -828,7 +770,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                         &mut ReclaimsSlotList::new(),
                         UpsertReclaim::IgnoreReclaims,
                     );
-                    vacant.insert(Arc::new(disk_entry));
+                    vacant.insert(Box::new(disk_entry));
                     (
                         false, /* found in mem */
                         true,  /* already existed */
@@ -868,19 +810,22 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         }
     }
 
-    /// assumes 1 entry in the slot list. Ignores overhead of the HashMap and such
-    pub const fn approx_size_of_one_entry() -> usize {
-        // with only one entry in the slot list, it is stored inline in the SmallVec
-        size_of::<Pubkey>() + size_of::<AccountMapEntry<T>>()
+    /// The footprint of a single element in the in-mem hashmap
+    pub const fn size_of_uninitialized() -> usize {
+        size_of::<Pubkey>() + size_of::<Box<AccountMapEntry<T>>>()
+    }
+
+    /// The size of an index value, with only a single entry in the slot list
+    pub const fn size_of_single_entry() -> usize {
+        size_of::<AccountMapEntry<T>>()
     }
 
     fn should_evict_based_on_age(
         current_age: Age,
         entry: &AccountMapEntry<T>,
-        startup: bool,
         ages_flushing_now: Age,
     ) -> bool {
-        startup || current_age.wrapping_sub(entry.age()) <= ages_flushing_now
+        current_age.wrapping_sub(entry.age()) <= ages_flushing_now
     }
 
     /// return true if 'entry' should be evicted from the in-mem index
@@ -888,13 +833,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         &self,
         current_age: Age,
         entry: &AccountMapEntry<T>,
-        startup: bool,
         update_stats: bool,
         ages_flushing_now: Age,
     ) -> bool {
         // this could be tunable dynamically based on memory pressure
         // we could look at more ages or we could throw out more items we are choosing to keep in the cache
-        if Self::should_evict_based_on_age(current_age, entry, startup, ages_flushing_now) {
+        if Self::should_evict_based_on_age(current_age, entry, ages_flushing_now) {
             if entry.ref_count() != 1 {
                 Self::update_stat(&self.stats().held_in_mem.ref_count, 1);
                 false
@@ -920,51 +864,54 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         }
     }
 
-    /// fill in `possible_evictions` from `iter` by checking age
+    /// Collect possible evictions from `iter` by checking age
+    /// Filter as much as possible and capture dirty flag
+    /// Skip entries with ref_count != 1 since they will be rejected later anyway
     fn gather_possible_evictions<'a>(
-        iter: impl Iterator<Item = (&'a Pubkey, &'a Arc<AccountMapEntry<T>>)>,
-        possible_evictions: &mut PossibleEvictions<T>,
-        startup: bool,
+        iter: impl Iterator<Item = (&'a Pubkey, &'a Box<AccountMapEntry<T>>)>,
         current_age: Age,
         ages_flushing_now: Age,
-    ) {
+    ) -> Vec<(Pubkey, /*is_dirty*/ bool)> {
+        let mut possible_evictions = Vec::new();
         for (k, v) in iter {
-            if !startup && current_age.wrapping_sub(v.age()) > ages_flushing_now {
+            if current_age.wrapping_sub(v.age()) > ages_flushing_now {
                 // not planning to evict this item from memory within 'ages_flushing_now' ages
                 continue;
             }
 
-            possible_evictions.insert(0, *k, Arc::clone(v));
+            // Skip entries with ref_count != 1 early
+            // In 99% of cases, these will be rejected by should_evict_from_mem or evict_from_cache anyway
+            // Filtering here avoids unnecessary work and reduces write lock contention in evict_from_cache
+            if v.ref_count() != 1 {
+                continue;
+            }
+
+            possible_evictions.push((*k, v.dirty()));
         }
+        possible_evictions
     }
 
     /// scan loop
     /// holds read lock
     /// identifies items which are potential candidates to evict
+    /// Returns pubkeys whose age indicates they may be evicted now, pending further checks.
+    /// Entries with ref_count != 1 are filtered out during scan
     fn flush_scan(
         &self,
         current_age: Age,
-        startup: bool,
         _flush_guard: &FlushGuard,
         ages_flushing_now: Age,
-    ) -> FlushScanResult<T> {
-        let mut possible_evictions = self.possible_evictions.write().unwrap();
-        possible_evictions.reset(1);
-        let m;
-        {
+    ) -> Vec<(Pubkey, /*is_dirty*/ bool)> {
+        let (possible_evictions, m) = {
             let map = self.map_internal.read().unwrap();
-            m = Measure::start("flush_scan"); // we don't care about lock time in this metric - bg threads can wait
-            Self::gather_possible_evictions(
-                map.iter(),
-                &mut possible_evictions,
-                startup,
-                current_age,
-                ages_flushing_now,
-            );
-        }
+            let m = Measure::start("flush_scan"); // we don't care about lock time in this metric - bg threads can wait
+            let possible_evictions =
+                Self::gather_possible_evictions(map.iter(), current_age, ages_flushing_now);
+            (possible_evictions, m)
+        };
         Self::update_time_stat(&self.stats().flush_scan_us, m);
 
-        possible_evictions.get_possible_evictions().unwrap()
+        possible_evictions
     }
 
     fn write_startup_info_to_disk(&self) {
@@ -1084,17 +1031,33 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         let current_age = self.storage.current_age();
         let iterate_for_age = self.get_should_age(current_age);
         let startup = self.storage.get_startup();
-        if !iterate_for_age && !startup {
-            // no need to age, so no need to flush this bucket
-            // but, at startup we want to evict from buckets as fast as possible if any items exist
+
+        if startup {
+            // At startup we do not insert index entries into the normal in-mem index.
+            // Instead, they are written to a startup-only struct.  Thus, at startup
+            // we only need to flush that startup struct and then can return early.
+            self.write_startup_info_to_disk();
+            if iterate_for_age {
+                // Note we still have to iterate ages too, since it is checked when
+                // transitioning from startup back to normal/steady state.
+                assert_eq!(current_age, self.storage.current_age());
+                self.set_has_aged(current_age, can_advance_age);
+            }
             return;
         }
 
-        if startup {
-            self.write_startup_info_to_disk();
+        // from this point forward, we know startup == false
+        debug_assert!(!startup);
+
+        if !iterate_for_age {
+            // no need to age, so no need to flush this bucket
+            return;
         }
 
-        let ages_flushing_now = if iterate_for_age && !startup {
+        // from this point forward, we know iterate_for_age == true
+        debug_assert!(iterate_for_age);
+
+        let ages_flushing_now = {
             let old_value = self
                 .remaining_ages_to_skip_flushing
                 .fetch_sub(1, Ordering::AcqRel);
@@ -1108,17 +1071,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                 return;
             }
             self.num_ages_to_distribute_flushes
-        } else {
-            // just 1 age to flush. 0 means age == age
-            0
         };
 
         Self::update_stat(&self.stats().buckets_scanned, 1);
 
         // scan in-mem map for items that we may evict
-        let FlushScanResult {
-            evictions_age_possible,
-        } = self.flush_scan(current_age, startup, flush_guard, ages_flushing_now);
+        let evictions_age_possible = self.flush_scan(current_age, flush_guard, ages_flushing_now);
 
         if !evictions_age_possible.is_empty() {
             // write to disk outside in-mem map read lock
@@ -1126,62 +1084,88 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             let mut flush_stats = DiskFlushStats::new();
             // we don't care about lock time in this metric - bg threads can wait
             let flush_update_measure = Measure::start("flush_update");
-            let evictions_age = evictions_age_possible
+
+            // Process each eviction candidate
+            // For dirty entries: lock map briefly, get entry, calculate disk value, release lock, then write to disk
+            // For clean entries: skip checks and pass to evict_from_cache
+            let evictions_age: Vec<_> = evictions_age_possible
                 .into_iter()
-                .filter_map(|(k, v)| {
-                    // consider whether to write to disk for all the items we may evict
-                    let mut mse = Measure::start("flush_should_evict");
-                    let should_evict = self.should_evict_from_mem(
-                        current_age,
-                        &v,
-                        startup,
-                        true,
-                        ages_flushing_now,
-                    );
-                    mse.stop();
-                    flush_stats.flush_should_evict_us += mse.as_us();
-                    if !should_evict {
-                        // not evicting, so don't write, even if dirty
-                        return None;
-                    };
+                .filter_map(|(key, is_dirty)| {
+                    if !is_dirty {
+                        // Entry was not dirty at scan time and had ref_count == 1
+                        // Skip all checks (including should_evict_from_mem) and do not do any disk ops
+                        // Pass directly to evict_from_cache, which will re-check conditions under write lock
+                        Some(key)
+                    } else {
+                        // Entry was dirty at scan time, need to write to disk
+                        let lock_measure = Measure::start("flush_read_lock");
+                        let (disk_entry, disk_ref_count) = {
+                            let map_read_guard = self.map_internal.read().unwrap();
+                            let entry = map_read_guard.get(&key)?;
 
-                    // if we are evicting it, then we need to update disk if we're dirty
-                    if v.clear_dirty() {
-                        // step 1: clear the dirty flag
-                        // step 2: perform the update on disk based on the fields in the entry
-                        // If a parallel operation dirties the item again - even while this flush is occurring,
-                        //  the last thing the writer will do, after updating contents, is set_dirty(true)
-                        //  That prevents dropping an item from cache before disk is updated to latest in mem.
-                        // It is possible that the item in the cache is marked as dirty while these updates are happening. That is ok.
-                        //  The dirty will be picked up and the item will be prevented from being evicted.
+                            let mut mse = Measure::start("flush_should_evict");
+                            let should_evict = self.should_evict_from_mem(
+                                current_age,
+                                entry,
+                                true,
+                                ages_flushing_now,
+                            );
+                            mse.stop();
+                            flush_stats.flush_should_evict_us += mse.as_us();
 
+                            if !should_evict {
+                                // not evicting, so don't write, even if dirty
+                                flush_stats.flush_read_lock_us += lock_measure.end_as_us();
+                                return None;
+                            }
+
+                            // Step 1: Clear the dirty flag
+                            // Step 2: Extract data and perform disk update outside the lock
+                            // Race condition handling: If a parallel operation dirties the item again after scanning,
+                            // then we will set_dirty(true) and skip the disk update. The dirty flag will ensure the
+                            // next flush picks up the item again. If the item becomes dirty during our disk write,
+                            // that's ok - the dirty flag will be picked up on the next flush and prevent us from
+                            // evicting the item from the cache.
+                            if !entry.clear_dirty() {
+                                // Entry was not dirty anymore, skip disk write
+                                flush_stats.flush_read_lock_us += lock_measure.end_as_us();
+                                return Some(key);
+                            }
+
+                            // Check the refcount before grabbing the slot list read lock
+                            let mut ref_count = entry.ref_count();
+                            if ref_count != 1 {
+                                entry.set_dirty(true);
+                                flush_stats.flush_read_lock_us += lock_measure.end_as_us();
+                                return None;
+                            }
+
+                            let slot_list = entry.slot_list_read_lock();
+                            ref_count = entry.ref_count(); // re-check ref count after grabbing slot list lock
+                            if ref_count != 1 || slot_list.len() != 1 {
+                                entry.set_dirty(true);
+                                flush_stats.flush_read_lock_us += lock_measure.end_as_us();
+                                return None;
+                            }
+
+                            // since we know slot_list.len() == 1, we can create a stack-allocated array for single element
+                            let (slot, info) = slot_list[0];
+                            let disk_entry = [(slot, info.into())];
+
+                            (disk_entry, ref_count)
+                        };
+
+                        flush_stats.flush_read_lock_us += lock_measure.end_as_us();
+
+                        // Now write to disk WITHOUT holding any locks
                         // may have to loop if disk has to grow and we have to retry the write
                         loop {
-                            let disk_resize = {
-                                // Check the refcount before grabbing the slot list read lock. If ref_count != 1, then skip.
-                                let mut ref_count = v.ref_count();
-                                if ref_count != 1 {
-                                    v.set_dirty(true);
-                                    return None;
-                                }
-
-                                // Re-acquire the slot list lock just before disk write to minimize lock contention
-                                let slot_list = v.slot_list_read_lock();
-                                ref_count = v.ref_count(); // neded to re-check ref count after grabbing slot list lock
-                                if ref_count != 1 || slot_list.len() != 1 {
-                                    v.set_dirty(true);
-                                    return None;
-                                }
-                                // since we know slot_list.len() == 1, we can create a stack-allocated array for single element.
-                                let (slot, info) = slot_list[0];
-                                let disk_entry = [(slot, info.into())];
-                                disk.try_write(&k, (&disk_entry, ref_count.into()))
-                            };
+                            let disk_resize =
+                                disk.try_write(&key, (&disk_entry, disk_ref_count.into()));
                             match disk_resize {
                                 Ok(_) => {
                                     // successfully written to disk
                                     flush_stats.flush_entries_updated_on_disk += 1;
-                                    // exit disk-resize loop
                                     break;
                                 }
                                 Err(err) => {
@@ -1192,15 +1176,17 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                                 }
                             }
                         }
+
+                        Some(key)
                     }
-                    Some(k)
                 })
                 .collect();
+
             flush_stats.flush_update_us = flush_update_measure.end_as_us();
-            flush_stats.update_to_bucket_map_stats(self.stats());
+            flush_stats.update_to_stats(self.stats());
 
             let m = Measure::start("flush_evict");
-            self.evict_from_cache(evictions_age, current_age, startup, ages_flushing_now);
+            self.evict_from_cache(evictions_age, current_age, ages_flushing_now);
             Self::update_time_stat(&self.stats().flush_evict_us, m);
         }
         if iterate_for_age {
@@ -1211,19 +1197,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
     }
 
     // evict keys in 'evictions' from in-mem cache, likely due to age
-    fn evict_from_cache(
-        &self,
-        evictions: Vec<Pubkey>,
-        current_age: Age,
-        startup: bool,
-        ages_flushing_now: Age,
-    ) {
+    fn evict_from_cache(&self, evictions: Vec<Pubkey>, current_age: Age, ages_flushing_now: Age) {
         if evictions.is_empty() {
             return;
         }
 
         let stats = self.stats();
-        let next_age_on_failure = self.storage.future_age_to_flush(false);
         let mut failed = 0;
         let mut evicted = 0;
         // chunk these so we don't hold the write lock too long
@@ -1233,24 +1212,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
             for k in evictions {
                 if let Entry::Occupied(occupied) = map.entry(*k) {
                     let v = occupied.get();
-                    if Arc::strong_count(v) > 1 {
-                        // someone is holding the value arc's ref count and could modify it, so do not evict
-                        failed += 1;
-                        v.try_exchange_age(next_age_on_failure, current_age);
-                        continue;
-                    }
 
                     if v.dirty()
-                        || !Self::should_evict_based_on_age(
-                            current_age,
-                            v,
-                            startup,
-                            ages_flushing_now,
-                        )
+                        || !Self::should_evict_based_on_age(current_age, v, ages_flushing_now)
                     {
                         // marked dirty or bumped in age after we looked above
                         // these evictions will be handled in later passes (at later ages)
-                        // but, at startup, everything is ready to age out if it isn't dirty
                         failed += 1;
                         continue;
                     }
@@ -1259,9 +1226,6 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
                     evicted += 1;
                     occupied.remove();
                 }
-            }
-            if map.is_empty() {
-                map.shrink_to_fit();
             }
             let capacity_post = map.capacity();
             drop(map);
@@ -1272,7 +1236,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> InMemAccountsIndex<T,
         Self::update_stat(&stats.failed_to_evict, failed as u64);
     }
 
-    pub fn stats(&self) -> &BucketMapHolderStats {
+    pub fn stats(&self) -> &Stats {
         &self.storage.stats
     }
 
@@ -1307,6 +1271,8 @@ struct DiskFlushStats {
     flush_entries_updated_on_disk: u64,
     /// Time spent growing disk storage
     flush_grow_us: u64,
+    /// Time spent holding map_internal read lock
+    flush_read_lock_us: u64,
 }
 
 impl DiskFlushStats {
@@ -1314,7 +1280,7 @@ impl DiskFlushStats {
         Self::default()
     }
 
-    fn update_to_bucket_map_stats(&self, stats: &BucketMapHolderStats) {
+    fn update_to_stats(&self, stats: &Stats) {
         Self::update_stat(&stats.flush_update_us, self.flush_update_us);
         Self::update_stat(&stats.flush_should_evict_us, self.flush_should_evict_us);
         Self::update_stat(
@@ -1322,6 +1288,7 @@ impl DiskFlushStats {
             self.flush_entries_updated_on_disk,
         );
         Self::update_stat(&stats.flush_grow_us, self.flush_grow_us);
+        Self::update_stat(&stats.flush_read_lock_us, self.flush_read_lock_us);
     }
 
     fn update_stat(stat: &AtomicU64, value: u64) {
@@ -1364,7 +1331,7 @@ impl Drop for FlushGuard<'_> {
 mod tests {
     use {
         super::*,
-        crate::accounts_index::{AccountsIndexConfig, IndexLimitMb, BINS_FOR_TESTING},
+        crate::accounts_index::{AccountsIndexConfig, IndexLimit, BINS_FOR_TESTING},
         assert_matches::assert_matches,
         itertools::Itertools,
         test_case::test_case,
@@ -1377,17 +1344,17 @@ mod tests {
             1,
         ));
         let bin = 0;
-        InMemAccountsIndex::new(&holder, bin)
+        InMemAccountsIndex::new(&holder, bin, None)
     }
 
     fn new_disk_buckets_for_test<T: IndexValue>() -> InMemAccountsIndex<T, T> {
         let config = AccountsIndexConfig {
-            index_limit_mb: IndexLimitMb::Minimal,
+            index_limit: IndexLimit::Minimal,
             ..Default::default()
         };
         let holder = Arc::new(BucketMapHolder::new(BINS_FOR_TESTING, &config, 1));
         let bin = 0;
-        let bucket = InMemAccountsIndex::new(&holder, bin);
+        let bucket = InMemAccountsIndex::new(&holder, bin, None);
         assert!(bucket.storage.is_disk_index_enabled());
         bucket
     }
@@ -1423,7 +1390,7 @@ mod tests {
         let pubkey = solana_pubkey::new_rand();
 
         // Insert an entry manually
-        let entry = Arc::new(AccountMapEntry::new(
+        let entry = Box::new(AccountMapEntry::new(
             SlotList::from([(0, 42)]),
             1,
             AccountMapEntryMeta::new_dirty(&accounts_index.storage, true),
@@ -1460,7 +1427,7 @@ mod tests {
             .try_write(&pubkey, disk_entry)
             .unwrap();
 
-        // Ensure the entry is not found in meory
+        // Ensure the entry is not found in memory
         let mut found = false;
         accounts_index.get_only_in_mem(&pubkey, false, |entry| {
             found = entry.is_some();
@@ -1501,7 +1468,7 @@ mod tests {
 
     #[test]
     fn test_update_slot_list_other_populate_reclaims() {
-        solana_logger::setup();
+        agave_logger::setup();
         let reclaim = UpsertReclaim::PopulateReclaims;
         let new_slot = 5;
         let info = 1;
@@ -1682,7 +1649,6 @@ mod tests {
     fn test_should_evict_from_mem_ref_count() {
         for ref_count in [0, 1, 2] {
             let bucket = new_for_test::<u64>();
-            let startup = false;
             let current_age = 0;
             let one_element_slot_list = SlotList::from([(0, 0)]);
             let one_element_slot_list_entry = AccountMapEntry::new(
@@ -1693,13 +1659,7 @@ mod tests {
 
             // exceeded budget
             assert_eq!(
-                bucket.should_evict_from_mem(
-                    current_age,
-                    &one_element_slot_list_entry,
-                    startup,
-                    false,
-                    1,
-                ),
+                bucket.should_evict_from_mem(current_age, &one_element_slot_list_entry, false, 1),
                 ref_count == 1
             );
         }
@@ -1707,14 +1667,13 @@ mod tests {
 
     #[test]
     fn test_gather_possible_evictions() {
-        solana_logger::setup();
-        let startup = false;
+        agave_logger::setup();
         let ref_count = 1;
         let map: HashMap<_, _> = (0..=255)
             .map(|age| {
                 let pk = Pubkey::from([age; 32]);
                 let one_element_slot_list = SlotList::from([(0, 0)]);
-                let one_element_slot_list_entry = Arc::new(AccountMapEntry::new(
+                let one_element_slot_list_entry = Box::new(AccountMapEntry::new(
                     one_element_slot_list,
                     ref_count,
                     AccountMapEntryMeta::default(),
@@ -1726,27 +1685,30 @@ mod tests {
 
         for current_age in 0..=255 {
             for ages_flushing_now in 0..=255 {
-                let mut possible_evictions = PossibleEvictions::new(1);
-                possible_evictions.reset(1);
-                InMemAccountsIndex::<u64, u64>::gather_possible_evictions(
+                let possible_evictions = InMemAccountsIndex::<u64, u64>::gather_possible_evictions(
                     map.iter(),
-                    &mut possible_evictions,
-                    startup,
                     current_age,
                     ages_flushing_now,
                 );
-                let evictions = possible_evictions.possible_evictions.pop().unwrap();
-                assert_eq!(
-                    evictions.evictions_age_possible.len(),
-                    1 + ages_flushing_now as usize
-                );
-                evictions.evictions_age_possible.iter().for_each(|key| {
-                    let entry = map.get(&key.0).unwrap();
+                // Verify that the number of entries selected for eviction matches the expected count.
+                // Test setup: map contains 256 entries with ages 0-255 (one entry per age value).
+                //
+                // gather_possible_evictions includes entries where:
+                //   current_age.wrapping_sub(entry.age) <= ages_flushing_now
+                // which is equivalent to:
+                //   entry.age >= current_age - ages_flushing_now (with wrapping)
+                //
+                // This selects entries in the age window [current_age - ages_flushing_now, current_age].
+                // The window size is (ages_flushing_now + 1) because both endpoints are inclusive.
+                //
+                // Example: If current_age=10 and ages_flushing_now=3, we select ages 7,8,9,10 = 4 entries.
+                assert_eq!(possible_evictions.len(), 1 + ages_flushing_now as usize);
+                possible_evictions.iter().for_each(|(key, _is_dirty)| {
+                    let entry = map.get(key).unwrap();
                     assert!(
                         InMemAccountsIndex::<u64, u64>::should_evict_based_on_age(
                             current_age,
                             entry,
-                            startup,
                             ages_flushing_now,
                         ),
                         "current_age: {}, age: {}, ages_flushing_now: {}",
@@ -1761,9 +1723,8 @@ mod tests {
 
     #[test]
     fn test_should_evict_from_mem() {
-        solana_logger::setup();
+        agave_logger::setup();
         let bucket = new_for_test::<u64>();
-        let mut startup = false;
         let mut current_age = 0;
         let ref_count = 1;
         let one_element_slot_list = SlotList::from([(0, 0)]);
@@ -1777,18 +1738,11 @@ mod tests {
         assert!(!bucket.should_evict_from_mem(
             current_age,
             &AccountMapEntry::new(SlotList::new(), ref_count, AccountMapEntryMeta::default()),
-            startup,
             false,
             0,
         ));
         // 1 element slot list
-        assert!(bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
+        assert!(bucket.should_evict_from_mem(current_age, &one_element_slot_list_entry, false, 0));
         // 2 element slot list
         assert!(!bucket.should_evict_from_mem(
             current_age,
@@ -1797,7 +1751,6 @@ mod tests {
                 ref_count,
                 AccountMapEntryMeta::default()
             ),
-            startup,
             false,
             0,
         ));
@@ -1812,45 +1765,22 @@ mod tests {
                     ref_count,
                     AccountMapEntryMeta::default()
                 ),
-                startup,
                 false,
                 0,
             ));
         }
 
         // 1 element slot list, age is now
-        assert!(bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
+        assert!(bucket.should_evict_from_mem(current_age, &one_element_slot_list_entry, false, 0));
 
         // 1 element slot list, but not current age
         current_age = 1;
-        assert!(!bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
-
-        // 1 element slot list, but at startup and age not current
-        startup = true;
-        assert!(bucket.should_evict_from_mem(
-            current_age,
-            &one_element_slot_list_entry,
-            startup,
-            false,
-            0,
-        ));
+        assert!(!bucket.should_evict_from_mem(current_age, &one_element_slot_list_entry, false, 0));
     }
 
     #[test]
     fn test_age() {
-        solana_logger::setup();
+        agave_logger::setup();
         let test = new_for_test::<u64>();
         assert!(test.get_should_age(test.storage.current_age()));
         assert_eq!(test.storage.count_buckets_flushed(), 0);
@@ -1873,7 +1803,7 @@ mod tests {
 
     #[test]
     fn test_update_slot_list_other_reclaim_old_slots() {
-        solana_logger::setup();
+        agave_logger::setup();
         let reclaim = UpsertReclaim::ReclaimOldSlots;
         let new_slot = 5;
         let info = 1;
@@ -2129,7 +2059,7 @@ mod tests {
 
         {
             // add an entry with an empty slot list
-            let val = Arc::new(AccountMapEntry::<u64>::empty_for_tests());
+            let val = Box::new(AccountMapEntry::<u64>::empty_for_tests());
             map.insert(key, val);
             let entry = map.entry(key);
             assert_matches!(entry, Entry::Occupied(_));
@@ -2143,7 +2073,7 @@ mod tests {
 
         {
             // add an entry with a NON empty slot list - it will NOT get removed
-            let val = Arc::new(AccountMapEntry::<u64>::empty_for_tests());
+            let val = Box::new(AccountMapEntry::<u64>::empty_for_tests());
             val.slot_list_write_lock().push((1, 1));
             map.insert(key, val);
             // does NOT remove it since it has a non-empty slot list
@@ -2189,5 +2119,32 @@ mod tests {
         );
         assert_eq!(test.slot_list_lock_read_len(), len);
         assert_eq!(len, 2);
+    }
+
+    #[test_case(Some(10000);  "with pre-allocation 10000")]
+    #[test_case(Some(20000);  "with pre-allocation 20000")]
+    #[test_case(Some(30000);  "with pre-allocation 30000")]
+    #[test_case(None; "without pre-allocation")]
+    fn test_new_with_num_initial_accounts(num_initial_accounts: Option<usize>) {
+        let config = AccountsIndexConfig::default();
+
+        let bin_counts = [2, 4, 8];
+
+        for bin_count in bin_counts {
+            let holder = Arc::new(BucketMapHolder::new(bin_count, &config, 1));
+            let mut total_capacity = 0;
+
+            for bin in 0..bin_count {
+                let accounts_index =
+                    InMemAccountsIndex::<u64, u64>::new(&holder, bin, num_initial_accounts);
+                total_capacity += accounts_index.map_internal.read().unwrap().capacity();
+            }
+
+            if let Some(num_initial_accounts) = num_initial_accounts {
+                assert!(total_capacity > num_initial_accounts);
+            } else {
+                assert_eq!(total_capacity, 0);
+            }
+        }
     }
 }

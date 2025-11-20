@@ -15,7 +15,8 @@ use {
     agave_feature_set::{self as feature_set, FeatureSet},
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_snapshots::{
-        ArchiveFormat, SnapshotVersion, DEFAULT_ARCHIVE_COMPRESSION, SUPPORTED_ARCHIVE_COMPRESSION,
+        snapshot_archive_info::SnapshotArchiveInfoGetter as _, ArchiveFormat, SnapshotVersion,
+        DEFAULT_ARCHIVE_COMPRESSION, SUPPORTED_ARCHIVE_COMPRESSION,
     },
     clap::{
         crate_description, crate_name, value_t, value_t_or_exit, values_t_or_exit, App,
@@ -67,14 +68,13 @@ use {
         bank_forks::BankForks,
         inflation_rewards::points::{InflationPointCalculationEvent, PointValue},
         installed_scheduler_pool::BankWithScheduler,
-        snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_bank_utils,
         snapshot_minimizer::SnapshotMinimizer,
+        stake_utils,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_shred_version::compute_shred_version,
     solana_stake_interface::{self as stake, state::StakeStateV2},
-    solana_stake_program::stake_state,
     solana_system_interface::program as system_program,
     solana_transaction::sanitized::MessageHash,
     solana_transaction_status::parse_ui_instruction,
@@ -859,7 +859,7 @@ fn main() {
         unsafe { signal_hook::low_level::register(signal_hook::consts::SIGUSR1, || {}) }.unwrap();
     }
 
-    solana_logger::setup_with_default_filter();
+    agave_logger::setup_with_default_filter();
 
     let load_genesis_config_arg = load_genesis_arg();
     let accounts_db_config_args = accounts_db_args();
@@ -1786,7 +1786,7 @@ fn main() {
                     create_new_ledger(
                         &output_directory,
                         &genesis_config,
-                        agave_snapshots::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+                        solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
                         LedgerColumnOptions::default(),
                     )
                     .unwrap_or_else(|err| {
@@ -1903,7 +1903,7 @@ fn main() {
 
                     if let Some(mut slot_recorder_config) = slot_recorder_config {
                         // Drop transaction_status_sender to break transaction_recorder
-                        // out of its' recieve loop
+                        // out of its' receive loop
                         let transaction_status_sender =
                             slot_recorder_config.transaction_status_sender.take();
                         drop(transaction_status_sender);
@@ -2334,17 +2334,18 @@ fn main() {
                                 ),
                             );
 
-                            let vote_account = vote_state::create_account_with_authorized(
+                            let vote_account = vote_state::create_v4_account_with_authorized(
                                 identity_pubkey,
                                 identity_pubkey,
                                 identity_pubkey,
-                                100,
+                                None,
+                                10000,
                                 rent.minimum_balance(VoteStateV4::size_of()).max(1),
                             );
 
                             bank.store_account(
                                 stake_pubkey,
-                                &stake_state::create_account(
+                                &stake_utils::create_stake_account(
                                     bootstrap_stake_authorized_pubkey
                                         .as_ref()
                                         .unwrap_or(identity_pubkey),
@@ -2570,8 +2571,8 @@ fn main() {
                     };
                     process_options.halt_at_slot = Some(parent_slot);
 
-                    // PrimaryForMaintenance needed over Secondary to purge any
-                    // existing simulated shreds from previous runs
+                    // PrimaryForMaintenance needed to purge (write) any existing simulated shreds
+                    // from previous runs
                     let blockstore = Arc::new(open_blockstore(
                         &ledger_path,
                         arg_matches,
@@ -3164,7 +3165,7 @@ fn main() {
                 }
                 ("compute-slot-cost", Some(arg_matches)) => {
                     let blockstore =
-                        open_blockstore(&ledger_path, arg_matches, AccessType::Secondary);
+                        open_blockstore(&ledger_path, arg_matches, AccessType::ReadOnly);
 
                     let mut slots: Vec<u64> = vec![];
                     if !arg_matches.is_present("slots") {

@@ -355,7 +355,7 @@ impl BankForks {
         self.dumped_slot_subscribers.push(notifier);
     }
 
-    /// Clears associated banks from BankForks and notifies subscribers that a dump has occured.
+    /// Clears associated banks from BankForks and notifies subscribers that a dump has occurred.
     pub fn dump_slots<'a, I>(&mut self, slots: I) -> (Vec<(Slot, BankId)>, Vec<BankWithScheduler>)
     where
         I: Iterator<Item = &'a Slot>,
@@ -832,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_bank_forks_different_set_root() {
-        solana_logger::setup();
+        agave_logger::setup();
         let leader_keypair = Keypair::new();
         let GenesisConfigInfo {
             mut genesis_config,

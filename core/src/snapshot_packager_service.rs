@@ -1,6 +1,9 @@
 mod snapshot_gossip_manager;
 use {
-    agave_snapshots::{snapshot_config::SnapshotConfig, snapshot_hash::StartingSnapshotHashes},
+    agave_snapshots::{
+        paths as snapshot_paths, snapshot_config::SnapshotConfig,
+        snapshot_hash::StartingSnapshotHashes,
+    },
     snapshot_gossip_manager::SnapshotGossipManager,
     solana_accounts_db::accounts_db::AccountStorageEntry,
     solana_clock::Slot,
@@ -188,7 +191,7 @@ impl SnapshotPackagerService {
         }
         info!("Flushing account storages... Done in {:?}", start.elapsed());
 
-        let bank_snapshot_dir = snapshot_utils::get_bank_snapshot_dir(
+        let bank_snapshot_dir = snapshot_paths::get_bank_snapshot_dir(
             &snapshot_config.bank_snapshots_dir,
             state.snapshot_slot,
         );
@@ -210,6 +213,21 @@ impl SnapshotPackagerService {
             "Hard linking account storages... Done in {:?}",
             start.elapsed(),
         );
+
+        info!("Saving obsolete accounts...");
+        let start = Instant::now();
+        let result = snapshot_utils::write_obsolete_accounts_to_snapshot(
+            &bank_snapshot_dir,
+            &state.snapshot_storages,
+            state.snapshot_slot,
+        );
+        if let Err(err) = result {
+            warn!("Failed to serialize obsolete accounts: {err}");
+            // If serializing the obsolete accounts failed, we do *NOT* want to mark the bank snapshot
+            // as loadable so return early.
+            return;
+        }
+        info!("Saving obsolete accounts... Done in {:?}", start.elapsed());
 
         let result = snapshot_utils::mark_bank_snapshot_as_loadable(&bank_snapshot_dir);
         if let Err(err) = result {

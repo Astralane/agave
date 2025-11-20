@@ -1311,9 +1311,9 @@ mod tests {
         solana_instruction::AccountMeta,
         solana_keypair::{read_keypair_file, write_keypair_file},
         solana_native_token::LAMPORTS_PER_SOL,
+        solana_net_utils::SocketAddrSpace,
         solana_signer::Signer,
         solana_stake_interface::instruction::StakeInstruction,
-        solana_streamer::socket::SocketAddrSpace,
         solana_test_validator::TestValidator,
         solana_transaction_status::TransactionConfirmationStatus,
         std::slice,
@@ -1947,7 +1947,7 @@ mod tests {
 
     #[test]
     fn test_check_payer_balances_distribute_tokens_separate_payers() {
-        solana_logger::setup();
+        agave_logger::setup();
         let alice = Keypair::new();
         let test_validator = simple_test_validator(alice.pubkey());
         let url = test_validator.rpc_url();
@@ -2185,7 +2185,7 @@ mod tests {
 
     #[test]
     fn test_check_payer_balances_distribute_stakes_separate_payers() {
-        solana_logger::setup();
+        agave_logger::setup();
         let alice = Keypair::new();
         let test_validator = simple_test_validator(alice.pubkey());
         let url = test_validator.rpc_url();

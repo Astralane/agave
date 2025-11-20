@@ -7,8 +7,11 @@ use {
     },
     solana_clock::Epoch,
     solana_instruction::error::InstructionError,
-    solana_stake_interface::{error::StakeError, stake_history::StakeHistory},
-    solana_stake_program::stake_state::{Stake, StakeStateV2},
+    solana_stake_interface::{
+        error::StakeError,
+        stake_history::StakeHistory,
+        state::{Stake, StakeStateV2},
+    },
     solana_vote::vote_state_view::VoteStateView,
 };
 
@@ -572,10 +575,10 @@ mod tests {
             )
         );
 
-        // credits_observed is auto-rewinded when vote_state credits are assumed to have been
+        // credits_observed is auto-rewound when vote_state credits are assumed to have been
         // recreated
         stake.credits_observed = 1000;
-        // this is new behavior 1; return the post-recreation rewinded credits from the vote account
+        // this is new behavior 1; return the post-recreation rewound credits from the vote account
         assert_eq!(
             CalculatedStakePoints {
                 points: 0,

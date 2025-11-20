@@ -44,6 +44,7 @@ use {
         thread::sleep,
         time::{Duration, Instant},
     },
+    tokio::sync::mpsc,
 };
 
 // transfer transaction cost = 1 * SIGNATURE_COST +
@@ -233,7 +234,7 @@ impl PacketsPerIteration {
 
 #[allow(clippy::cognitive_complexity)]
 fn main() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let matches = Command::new(crate_name!())
         .about(crate_description!())
@@ -466,6 +467,7 @@ fn main() {
         non_vote_receiver,
         tpu_vote_receiver,
         gossip_vote_receiver,
+        mpsc::channel(1).1,
         block_production_num_workers,
         SchedulerConfig {
             scheduler_pacing: SchedulerPacing::Disabled,
@@ -579,7 +581,7 @@ fn main() {
 
         // This signature clear may not actually clear the signatures
         // in this chunk, but since we rotate between CHUNKS then
-        // we should clear them by the time we come around again to re-use that chunk.
+        // we should clear them by the time we come around again to reuse that chunk.
         bank.clear_signatures();
         total_us += now.elapsed().as_micros() as u64;
         total_sent += sent;

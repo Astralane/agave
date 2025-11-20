@@ -77,7 +77,7 @@ pub(crate) enum Shred {
 
 impl Shred {
     dispatch!(fn erasure_shard_index(&self) -> Result<usize, Error>);
-    dispatch!(fn erasure_shard_mut(&mut self) -> Result<PayloadMutGuard<Range<usize>>, Error>);
+    dispatch!(fn erasure_shard_mut(&mut self) -> Result<PayloadMutGuard<'_, Range<usize>>, Error>);
     dispatch!(fn merkle_node(&self) -> Result<Hash, Error>);
     dispatch!(fn sanitize(&self) -> Result<(), Error>);
     dispatch!(fn set_chained_merkle_root(&mut self, chained_merkle_root: &Hash) -> Result<(), Error>);
@@ -444,7 +444,7 @@ macro_rules! impl_merkle_shred {
         }
 
         // Returns the erasure coded slice as a mutable reference.
-        fn erasure_shard_mut(&mut self) -> Result<PayloadMutGuard<Range<usize>>, Error> {
+        fn erasure_shard_mut(&mut self) -> Result<PayloadMutGuard<'_, Range<usize>>, Error> {
             let offsets = self.erasure_shard_offsets()?;
             let payload_size = self.payload.len();
             self.payload
@@ -626,7 +626,7 @@ fn get_merkle_node(shred: &[u8], offsets: Range<usize>) -> Result<Hash, Error> {
 pub(super) fn recover(
     mut shreds: Vec<Shred>,
     reed_solomon_cache: &ReedSolomonCache,
-) -> Result<impl Iterator<Item = Result<Shred, Error>>, Error> {
+) -> Result<impl Iterator<Item = Result<Shred, Error>> + use<>, Error> {
     // Sort shreds by their erasure shard index.
     // In particular this places all data shreds before coding shreds.
     let is_sorted = |(a, b)| cmp_shred_erasure_shard_index(a, b).is_le();
@@ -1371,8 +1371,8 @@ mod test {
 
     #[test]
     fn test_merkle_proof_entry_from_hash() {
-        let mut rng = rand::thread_rng();
-        let bytes: [u8; 32] = rng.gen();
+        let mut rng = rand::rng();
+        let bytes: [u8; 32] = rng.random();
         let hash = Hash::from(bytes);
         let entry = &hash.as_ref()[..SIZE_OF_MERKLE_PROOF_ENTRY];
         let entry = MerkleProofEntry::try_from(entry).unwrap();
@@ -1381,8 +1381,8 @@ mod test {
 
     #[test]
     fn test_make_merkle_proof_error() {
-        let mut rng = rand::thread_rng();
-        let nodes = repeat_with(|| rng.gen::<[u8; 32]>()).map(Hash::from);
+        let mut rng = rand::rng();
+        let nodes = repeat_with(|| rng.random::<[u8; 32]>()).map(Hash::from);
         let nodes: Vec<_> = nodes.take(5).collect();
         let size = nodes.len();
         let tree = make_merkle_tree(nodes.into_iter().map(Ok)).unwrap();
@@ -1409,7 +1409,7 @@ mod test {
     #[test_case(73, false)]
     #[test_case(73, true)]
     fn test_recover_merkle_shreds(num_shreds: usize, resigned: bool) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let reed_solomon_cache = ReedSolomonCache::default();
         for num_data_shreds in 1..num_shreds {
             let num_coding_shreds = num_shreds - num_data_shreds;
@@ -1442,13 +1442,13 @@ mod test {
             },
             slot: 145_865_705,
             index: 1835,
-            version: rng.gen(),
+            version: rng.random(),
             fec_set_index: 1835,
         };
         let data_header = {
-            let reference_tick = rng.gen_range(0..0x40);
+            let reference_tick = rng.random_range(0..0x40);
             DataShredHeader {
-                parent_offset: rng.gen::<u16>().max(1),
+                parent_offset: rng.random::<u16>().max(1),
                 flags: ShredFlags::from_bits_retain(reference_tick),
                 size: 0,
             }
@@ -1464,7 +1464,7 @@ mod test {
                 index: common_header.index + i as u32,
                 ..common_header
             };
-            let size = ShredData::SIZE_OF_HEADERS + rng.gen_range(0..capacity);
+            let size = ShredData::SIZE_OF_HEADERS + rng.random_range(0..capacity);
             let data_header = DataShredHeader {
                 size: size as u16,
                 ..data_header
@@ -1588,7 +1588,7 @@ mod test {
         [true, false]
     )]
     fn test_make_shreds_from_data(data_size: usize, is_last_in_slot: bool) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let data_size = data_size.saturating_sub(16);
         let reed_solomon_cache = ReedSolomonCache::default();
         for data_size in data_size..data_size + 32 {
@@ -1599,10 +1599,10 @@ mod test {
     #[test_case(true)]
     #[test_case(false)]
     fn test_make_shreds_from_data_rand(is_last_in_slot: bool) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let reed_solomon_cache = ReedSolomonCache::default();
         for _ in 0..32 {
-            let data_size = rng.gen_range(0..31200 * 7);
+            let data_size = rng.random_range(0..31200 * 7);
             run_make_shreds_from_data(&mut rng, data_size, is_last_in_slot, &reed_solomon_cache);
         }
     }
@@ -1611,7 +1611,7 @@ mod test {
     #[test_case(true)]
     #[test_case(false)]
     fn test_make_shreds_from_data_paranoid(is_last_in_slot: bool) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let reed_solomon_cache = ReedSolomonCache::default();
         for data_size in 0..=PACKET_DATA_SIZE * 4 * 64 {
             run_make_shreds_from_data(&mut rng, data_size, is_last_in_slot, &reed_solomon_cache);
@@ -1626,13 +1626,13 @@ mod test {
     ) {
         let thread_pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
         let keypair = Keypair::new();
-        let chained_merkle_root = Hash::new_from_array(rng.gen());
+        let chained_merkle_root = Hash::new_from_array(rng.random());
         let slot = 149_745_689;
-        let parent_slot = slot - rng.gen_range(1..65536);
-        let shred_version = rng.gen();
-        let reference_tick = rng.gen_range(1..64);
-        let next_shred_index = rng.gen_range(0..671);
-        let next_code_index = rng.gen_range(0..781);
+        let parent_slot = slot - rng.random_range(1..65536);
+        let shred_version = rng.random();
+        let reference_tick = rng.random_range(1..64);
+        let next_shred_index = rng.random_range(0..671);
+        let next_code_index = rng.random_range(0..781);
         let mut data = vec![0u8; data_size];
         rng.fill(&mut data[..]);
         let shreds = make_shreds_from_data(
@@ -1830,7 +1830,7 @@ mod test {
                 Shred::ShredCode(_) => Some(shred.clone()),
                 Shred::ShredData(_) => None,
             })
-            .group_by(|shred| shred.common_header().fec_set_index)
+            .chunk_by(|shred| shred.common_header().fec_set_index)
             .into_iter()
             .flat_map(|(_, shreds)| {
                 recover(shreds.collect(), reed_solomon_cache)

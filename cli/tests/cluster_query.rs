@@ -9,9 +9,9 @@ use {
     solana_fee_structure::FeeStructure,
     solana_keypair::Keypair,
     solana_native_token::LAMPORTS_PER_SOL,
+    solana_net_utils::SocketAddrSpace,
     solana_rpc_client::rpc_client::RpcClient,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_test_validator::TestValidator,
     std::time::Duration,
     test_case::test_case,
@@ -20,7 +20,7 @@ use {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_ping(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
     let fee = FeeStructure::default().get_max_fee(1, 0);
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();

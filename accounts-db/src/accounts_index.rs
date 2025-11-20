@@ -1,27 +1,25 @@
 mod account_map_entry;
+mod accounts_index_storage;
+mod bucket_map_holder;
 pub(crate) mod in_mem_accounts_index;
 mod iter;
 mod roots_tracker;
 mod secondary;
+mod stats;
 use {
     crate::{
-        accounts_index::account_map_entry::SlotListWriteGuard,
-        accounts_index_storage::{AccountsIndexStorage, Startup},
-        ancestors::Ancestors,
-        bucket_map_holder::Age,
-        bucket_map_holder_stats::BucketMapHolderStats,
-        contains::Contains,
-        is_zero_lamport::IsZeroLamport,
-        pubkey_bins::PubkeyBinCalculator24,
-        rolling_bit_field::RollingBitField,
+        ancestors::Ancestors, contains::Contains, is_zero_lamport::IsZeroLamport,
+        pubkey_bins::PubkeyBinCalculator24, rolling_bit_field::RollingBitField,
     },
-    account_map_entry::{AccountMapEntry, PreAllocatedAccountMapEntry},
+    account_map_entry::{AccountMapEntry, PreAllocatedAccountMapEntry, SlotListWriteGuard},
+    accounts_index_storage::AccountsIndexStorage,
+    bucket_map_holder::Age,
     in_mem_accounts_index::{
         ExistedLocation, InMemAccountsIndex, InsertNewEntryResults, StartupStats,
     },
     iter::{AccountsIndexPubkeyIterOrder, AccountsIndexPubkeyIterator},
     log::*,
-    rand::{thread_rng, Rng},
+    rand::{rng, Rng},
     rayon::iter::{IntoParallelIterator, ParallelIterator},
     roots_tracker::RootsTracker,
     secondary::{RwLockSecondaryIndexEntry, SecondaryIndex, SecondaryIndexEntry},
@@ -30,6 +28,7 @@ use {
     solana_clock::{BankId, Slot},
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
+    stats::Stats,
     std::{
         collections::{btree_map::BTreeMap, HashSet},
         fmt::Debug,
@@ -59,17 +58,19 @@ pub const ACCOUNTS_INDEX_CONFIG_FOR_TESTING: AccountsIndexConfig = AccountsIndex
     bins: Some(BINS_FOR_TESTING),
     num_flush_threads: Some(FLUSH_THREADS_TESTING),
     drives: None,
-    index_limit_mb: IndexLimitMb::InMemOnly,
+    index_limit: IndexLimit::InMemOnly,
     ages_to_stay_in_cache: None,
     scan_results_limit_bytes: None,
+    num_initial_accounts: None,
 };
 pub const ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS: AccountsIndexConfig = AccountsIndexConfig {
     bins: Some(BINS_FOR_BENCHMARKS),
     num_flush_threads: Some(FLUSH_THREADS_TESTING),
     drives: None,
-    index_limit_mb: IndexLimitMb::InMemOnly,
+    index_limit: IndexLimit::InMemOnly,
     ages_to_stay_in_cache: None,
     scan_results_limit_bytes: None,
+    num_initial_accounts: None,
 };
 pub type ScanResult<T> = Result<T, ScanError>;
 pub type SlotList<T> = SmallVec<[(Slot, T); 1]>;
@@ -226,9 +227,9 @@ enum ScanTypes<R: RangeBounds<Pubkey>> {
     Indexed(IndexKey),
 }
 
-/// specification of how much memory in-mem portion of account index can use
+/// specification of how much memory the in-mem portion of account index can use
 #[derive(Debug, Copy, Clone)]
-pub enum IndexLimitMb {
+pub enum IndexLimit {
     /// use disk index while keeping a minimal amount in-mem
     Minimal,
     /// in-mem-only was specified, no disk index
@@ -240,9 +241,11 @@ pub struct AccountsIndexConfig {
     pub bins: Option<usize>,
     pub num_flush_threads: Option<NonZeroUsize>,
     pub drives: Option<Vec<PathBuf>>,
-    pub index_limit_mb: IndexLimitMb,
+    pub index_limit: IndexLimit,
     pub ages_to_stay_in_cache: Option<Age>,
     pub scan_results_limit_bytes: Option<usize>,
+    /// Initial number of accounts, used to pre-allocate HashMap capacity at startup.
+    pub num_initial_accounts: Option<usize>,
 }
 
 impl Default for AccountsIndexConfig {
@@ -251,9 +254,10 @@ impl Default for AccountsIndexConfig {
             bins: None,
             num_flush_threads: None,
             drives: None,
-            index_limit_mb: IndexLimitMb::InMemOnly,
+            index_limit: IndexLimit::InMemOnly,
             ages_to_stay_in_cache: None,
             scan_results_limit_bytes: None,
+            num_initial_accounts: None,
         }
     }
 }
@@ -1003,7 +1007,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         rv.map(|index| slot_list.len() - 1 - index)
     }
 
-    pub(crate) fn bucket_map_holder_stats(&self) -> &BucketMapHolderStats {
+    pub(crate) fn stats(&self) -> &Stats {
         &self.storage.storage.stats
     }
 
@@ -1012,7 +1016,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         &self.storage.storage.startup_stats
     }
 
-    pub fn set_startup(&self, value: Startup) {
+    pub(crate) fn set_startup(&self, value: Startup) {
         self.storage.set_startup(value);
     }
 
@@ -1053,7 +1057,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         pubkeys.into_iter().for_each(|pubkey| {
             let bin = self.bin_calculator.bin_from_pubkey(pubkey);
             if bin != last_bin {
-                // cannot re-use lock since next pubkey is in a different bin than previous one
+                // cannot reuse lock since next pubkey is in a different bin than previous one
                 lock = Some(&self.account_maps[bin]);
                 last_bin = bin;
             }
@@ -1313,7 +1317,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
         // This results in calls to insert_new_entry_if_missing_with_lock from different threads starting at different bins to avoid
         // lock contention.
         let bins = self.bins();
-        let random_bin_offset = thread_rng().gen_range(0..bins);
+        let random_bin_offset = rng().random_range(0..bins);
         let bin_calc = self.bin_calculator;
         items.sort_unstable_by(|(pubkey_a, _), (pubkey_b, _)| {
             ((bin_calc.bin_from_pubkey(pubkey_a) + random_bin_offset) % bins)
@@ -1728,14 +1732,22 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> AccountsIndex<T, U> {
     }
 }
 
+/// modes the system can be in
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Startup {
+    /// not startup, but steady state execution
+    Normal,
+    /// startup (not steady state execution)
+    /// requesting 'startup'-like behavior where in-mem acct idx items are flushed asap
+    Startup,
+}
+
 #[cfg(test)]
 pub mod tests {
     use {
-        super::*,
-        crate::{
-            accounts_index::account_map_entry::AccountMapEntryMeta,
-            bucket_map_holder::BucketMapHolder,
-        },
+        super::{bucket_map_holder::BucketMapHolder, *},
+        crate::accounts_index::account_map_entry::AccountMapEntryMeta,
         solana_account::{AccountSharedData, WritableAccount},
         solana_pubkey::PUBKEY_BYTES,
         spl_generic_token::{spl_token_ids, token::SPL_TOKEN_ACCOUNT_OWNER_OFFSET},
@@ -2229,10 +2241,10 @@ pub mod tests {
         let key = solana_pubkey::new_rand();
 
         let mut config = ACCOUNTS_INDEX_CONFIG_FOR_TESTING;
-        config.index_limit_mb = if use_disk {
-            IndexLimitMb::Minimal
+        config.index_limit = if use_disk {
+            IndexLimit::Minimal
         } else {
-            IndexLimitMb::InMemOnly // in-mem only
+            IndexLimit::InMemOnly
         };
         let index = AccountsIndex::<T, T>::new(&config, Arc::default());
         let mut gc = ReclaimsSlotList::new();
@@ -2780,7 +2792,7 @@ pub mod tests {
 
     #[test]
     fn test_update_new_slot() {
-        solana_logger::setup();
+        agave_logger::setup();
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<bool, bool>::default_for_tests();
         let ancestors = vec![(0, 0)].into_iter().collect();
@@ -3156,7 +3168,7 @@ pub mod tests {
 
     #[test]
     fn test_reclaim_older_items_in_slot_list() {
-        solana_logger::setup();
+        agave_logger::setup();
         let key = solana_pubkey::new_rand();
         let index = AccountsIndex::<u64, u64>::default_for_tests();
         let mut gc = ReclaimsSlotList::new();
@@ -3249,7 +3261,7 @@ pub mod tests {
 
     #[test]
     fn test_reclaim_do_not_reclaim_cached_other_slot() {
-        solana_logger::setup();
+        agave_logger::setup();
         let key = solana_pubkey::new_rand();
         let index =
             AccountsIndex::<CacheableIndexValueTest, CacheableIndexValueTest>::default_for_tests();
@@ -3925,7 +3937,7 @@ pub mod tests {
 
     #[test]
     fn test_clean_rooted_entries_return() {
-        solana_logger::setup();
+        agave_logger::setup();
         let value = true;
         let key = solana_pubkey::new_rand();
         let key_unknown = solana_pubkey::new_rand();

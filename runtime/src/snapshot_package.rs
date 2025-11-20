@@ -2,7 +2,7 @@
 use solana_hash::Hash;
 use {
     crate::bank::{Bank, BankFieldsToSerialize, BankHashStats, BankSlotDelta},
-    agave_snapshots::snapshot_hash::SnapshotHash,
+    agave_snapshots::{snapshot_hash::SnapshotHash, SnapshotArchiveKind, SnapshotKind},
     solana_accounts_db::accounts_db::AccountStorageEntry,
     solana_clock::Slot,
     std::{
@@ -39,7 +39,10 @@ impl SnapshotPackage {
         status_cache_slot_deltas: Vec<BankSlotDelta>,
     ) -> Self {
         let slot = bank.slot();
-        if let SnapshotKind::IncrementalSnapshot(incremental_snapshot_base_slot) = snapshot_kind {
+        if let SnapshotKind::Archive(SnapshotArchiveKind::Incremental(
+            incremental_snapshot_base_slot,
+        )) = snapshot_kind
+        {
             assert!(
                 slot > incremental_snapshot_base_slot,
                 "Incremental snapshot base slot must be less than the bank being snapshotted!"
@@ -73,7 +76,7 @@ impl SnapshotPackage {
     /// Only use for tests; many of the fields are invalid!
     pub fn default_for_tests() -> Self {
         Self {
-            snapshot_kind: SnapshotKind::FullSnapshot,
+            snapshot_kind: SnapshotKind::Archive(SnapshotArchiveKind::Full),
             slot: Slot::default(),
             block_height: Slot::default(),
             hash: SnapshotHash(Hash::default()),
@@ -94,22 +97,5 @@ impl std::fmt::Debug for SnapshotPackage {
             .field("slot", &self.slot)
             .field("block_height", &self.block_height)
             .finish_non_exhaustive()
-    }
-}
-
-/// Snapshots come in two kinds, Full and Incremental.  The IncrementalSnapshot has a Slot field,
-/// which is the incremental snapshot base slot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SnapshotKind {
-    FullSnapshot,
-    IncrementalSnapshot(Slot),
-}
-
-impl SnapshotKind {
-    pub fn is_full_snapshot(&self) -> bool {
-        matches!(self, SnapshotKind::FullSnapshot)
-    }
-    pub fn is_incremental_snapshot(&self) -> bool {
-        matches!(self, SnapshotKind::IncrementalSnapshot(_))
     }
 }

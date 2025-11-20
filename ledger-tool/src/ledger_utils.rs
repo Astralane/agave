@@ -1,7 +1,7 @@
 use {
     crate::LEDGER_TOOL_DIRECTORY,
     agave_snapshots::{
-        hardened_unpack::open_genesis_config,
+        paths::{self as snapshot_paths, BANK_SNAPSHOTS_DIR},
         snapshot_config::{SnapshotConfig, SnapshotUsage},
         snapshot_hash::StartingSnapshotHashes,
     },
@@ -14,6 +14,7 @@ use {
     solana_clock::Slot,
     solana_core::validator::BlockVerificationMethod,
     solana_genesis_config::GenesisConfig,
+    solana_genesis_utils::open_genesis_config,
     solana_geyser_plugin_manager::geyser_plugin_service::{
         GeyserPluginService, GeyserPluginServiceError,
     },
@@ -37,7 +38,7 @@ use {
         bank_forks::BankForks,
         prioritization_fee_cache::PrioritizationFeeCache,
         snapshot_controller::SnapshotController,
-        snapshot_utils::{self, clean_orphaned_account_snapshot_dirs, BANK_SNAPSHOTS_DIR},
+        snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
     },
     solana_transaction::versioned::VersionedTransaction,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
@@ -79,7 +80,7 @@ pub(crate) enum LoadAndProcessLedgerError {
     #[error("failed to create all run and snapshot directories: {0}")]
     CreateAllAccountsRunAndSnapshotDirectories(#[source] std::io::Error),
 
-    #[error("custom accounts path is not supported with secondary blockstore access")]
+    #[error("custom accounts path is not supported with read-only blockstore access")]
     CustomAccountsPathUnsupported(#[source] BlockstoreError),
 
     #[error(
@@ -154,10 +155,10 @@ pub fn load_and_process_ledger(
             .map(PathBuf::from)
             .unwrap_or_else(|| snapshots_dir.clone());
         if let Some(full_snapshot_slot) =
-            snapshot_utils::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir)
+            snapshot_paths::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir)
         {
             let incremental_snapshot_slot =
-                snapshot_utils::get_highest_incremental_snapshot_archive_slot(
+                snapshot_paths::get_highest_incremental_snapshot_archive_slot(
                     &incremental_snapshot_archives_dir,
                     full_snapshot_slot,
                 )
@@ -237,7 +238,7 @@ pub fn load_and_process_ledger(
             .join(LEDGER_TOOL_DIRECTORY)
             .join("accounts");
         info!(
-            "Default accounts path is switched aligning with Blockstore's secondary access: \
+            "Default accounts path is switched aligning with Blockstore's read-only access: \
              {non_primary_accounts_path:?}"
         );
         vec![non_primary_accounts_path]
@@ -459,15 +460,15 @@ pub fn open_blockstore(
                 .starts_with("Invalid argument: Column family not found:");
             // The blockstore settings with Primary access can resolve the
             // above issues automatically, so only emit the help messages
-            // if access type is Secondary
-            let is_secondary = access_type == AccessType::Secondary;
+            // if access type is ReadOnly
+            let is_read_only = access_type == AccessType::ReadOnly;
 
-            if missing_blockstore && is_secondary {
+            if missing_blockstore && is_read_only {
                 eprintln!(
                     "Failed to open blockstore at {ledger_path:?}, it is missing at least one \
                      critical file: {err:?}"
                 );
-            } else if missing_column && is_secondary {
+            } else if missing_column && is_read_only {
                 eprintln!(
                     "Failed to open blockstore at {ledger_path:?}, it does not have all necessary \
                      columns: {err:?}"
@@ -558,7 +559,7 @@ pub fn get_program_ids(tx: &VersionedTransaction) -> impl Iterator<Item = &Pubke
 /// Get the AccessType required, based on `process_options`
 pub(crate) fn get_access_type(process_options: &ProcessOptions) -> AccessType {
     match process_options.use_snapshot_archives_at_startup {
-        UseSnapshotArchivesAtStartup::Always => AccessType::Secondary,
+        UseSnapshotArchivesAtStartup::Always => AccessType::ReadOnly,
         UseSnapshotArchivesAtStartup::Never => AccessType::PrimaryForMaintenance,
         UseSnapshotArchivesAtStartup::WhenNewest => AccessType::PrimaryForMaintenance,
     }

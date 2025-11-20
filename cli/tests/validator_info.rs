@@ -7,9 +7,9 @@ use {
     solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_keypair::{keypair_from_seed, Keypair},
+    solana_net_utils::SocketAddrSpace,
     solana_rpc_client::rpc_client::RpcClient,
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_test_validator::TestValidator,
     test_case::test_case,
 };
@@ -17,7 +17,7 @@ use {
 #[test_case(None; "base")]
 #[test_case(Some(1_000_000); "with_compute_unit_price")]
 fn test_publish(compute_unit_price: Option<u64>) {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
