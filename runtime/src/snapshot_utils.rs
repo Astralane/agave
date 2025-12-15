@@ -2,17 +2,18 @@
 use solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs;
 use {
     crate::{
-        bank::{BankFieldsToDeserialize, BankFieldsToSerialize, BankHashStats, BankSlotDelta},
+        bank::BankFieldsToDeserialize,
         serde_snapshot::{
             self, AccountsDbFields, ExtraFieldsToSerialize, SerdeObsoleteAccountsMap,
             SerializableAccountStorageEntry, SnapshotAccountsDbFields, SnapshotBankFields,
             SnapshotStreams,
         },
-        snapshot_package::SnapshotPackage,
+        snapshot_package::BankSnapshotPackage,
         snapshot_utils::snapshot_storage_rebuilder::{
             get_slot_and_append_vec_id, SnapshotStorageRebuilder,
         },
     },
+    agave_fs::buffered_writer::large_file_buf_writer,
     agave_snapshots::{
         archive_snapshot,
         error::{
@@ -26,8 +27,8 @@ use {
             SnapshotArchiveInfoGetter,
         },
         snapshot_config::SnapshotConfig,
-        streaming_unarchive_snapshot, ArchiveFormat, Result, SnapshotArchiveKind, SnapshotKind,
-        SnapshotVersion,
+        snapshot_hash::SnapshotHash,
+        streaming_unarchive_snapshot, ArchiveFormat, Result, SnapshotArchiveKind, SnapshotVersion,
     },
     crossbeam_channel::{Receiver, Sender},
     log::*,
@@ -45,7 +46,7 @@ use {
         cmp::Ordering,
         collections::{HashMap, HashSet},
         fs,
-        io::{self, BufReader, BufWriter, Error as IoError, Read, Seek, Write},
+        io::{self, BufReader, Error as IoError, Read, Seek, Write},
         mem,
         num::NonZeroUsize,
         path::{Path, PathBuf},
@@ -435,43 +436,20 @@ pub fn remove_tmp_snapshot_archives(snapshot_archives_dir: impl AsRef<Path>) {
     }
 }
 
-/// Serializes and archives a snapshot package
-pub fn serialize_and_archive_snapshot_package(
-    snapshot_package: SnapshotPackage,
+/// Creates an archive based on the bank snapshot and snapshot storages
+pub fn archive_snapshot_package(
+    snapshot_archive_kind: SnapshotArchiveKind,
+    snapshot_slot: Slot,
+    snapshot_hash: SnapshotHash,
+    bank_snapshot_dir: impl AsRef<Path>,
+    mut snapshot_storages: Vec<Arc<AccountStorageEntry>>,
     snapshot_config: &SnapshotConfig,
-    should_flush_and_hard_link_storages: bool,
 ) -> Result<SnapshotArchiveInfo> {
-    let SnapshotPackage {
-        snapshot_kind,
-        slot: snapshot_slot,
-        block_height: _,
-        hash: snapshot_hash,
-        mut snapshot_storages,
-        status_cache_slot_deltas,
-        bank_fields_to_serialize,
-        bank_hash_stats,
-        write_version,
-        enqueued: _,
-    } = snapshot_package;
-
-    let bank_snapshot_info = serialize_snapshot(
-        &snapshot_config.bank_snapshots_dir,
-        snapshot_config.snapshot_version,
-        snapshot_storages.as_slice(),
-        status_cache_slot_deltas.as_slice(),
-        bank_fields_to_serialize,
-        bank_hash_stats,
-        write_version,
-        should_flush_and_hard_link_storages,
-    )?;
-
-    let SnapshotKind::Archive(snapshot_archive_kind) = snapshot_kind;
-
     let snapshot_archive_path = match snapshot_archive_kind {
         SnapshotArchiveKind::Full => snapshot_paths::build_full_snapshot_archive_path(
             &snapshot_config.full_snapshot_archives_dir,
-            snapshot_package.slot,
-            &snapshot_package.hash,
+            snapshot_slot,
+            &snapshot_hash,
             snapshot_config.archive_format,
         ),
         SnapshotArchiveKind::Incremental(incremental_snapshot_base_slot) => {
@@ -481,8 +459,8 @@ pub fn serialize_and_archive_snapshot_package(
             snapshot_paths::build_incremental_snapshot_archive_path(
                 &snapshot_config.incremental_snapshot_archives_dir,
                 incremental_snapshot_base_slot,
-                snapshot_package.slot,
-                &snapshot_package.hash,
+                snapshot_slot,
+                &snapshot_hash,
                 snapshot_config.archive_format,
             )
         }
@@ -493,7 +471,7 @@ pub fn serialize_and_archive_snapshot_package(
         snapshot_slot,
         snapshot_hash,
         snapshot_storages.as_slice(),
-        &bank_snapshot_info.snapshot_dir,
+        &bank_snapshot_dir,
         snapshot_archive_path,
         snapshot_config.archive_format,
     )?;
@@ -502,17 +480,20 @@ pub fn serialize_and_archive_snapshot_package(
 }
 
 /// Serializes a snapshot into `bank_snapshots_dir`
-#[allow(clippy::too_many_arguments)]
-fn serialize_snapshot(
+pub fn serialize_snapshot(
     bank_snapshots_dir: impl AsRef<Path>,
     snapshot_version: SnapshotVersion,
+    bank_snapshot_package: BankSnapshotPackage,
     snapshot_storages: &[Arc<AccountStorageEntry>],
-    slot_deltas: &[BankSlotDelta],
-    mut bank_fields: BankFieldsToSerialize,
-    bank_hash_stats: BankHashStats,
-    write_version: u64,
     should_flush_and_hard_link_storages: bool,
 ) -> Result<BankSnapshotInfo> {
+    let BankSnapshotPackage {
+        mut bank_fields,
+        bank_hash_stats,
+        status_cache_slot_deltas,
+        write_version,
+    } = bank_snapshot_package;
+    let status_cache_slot_deltas = status_cache_slot_deltas.as_slice();
     let slot = bank_fields.slot;
 
     // this lambda function is to facilitate converting between
@@ -537,7 +518,7 @@ fn serialize_snapshot(
             bank_snapshot_path.display(),
         );
 
-        let bank_snapshot_serializer = move |stream: &mut BufWriter<fs::File>| -> Result<()> {
+        let bank_snapshot_serializer = move |stream: &mut dyn Write| -> Result<()> {
             let versioned_epoch_stakes = mem::take(&mut bank_fields.versioned_epoch_stakes);
             let extra_fields = ExtraFieldsToSerialize {
                 lamports_per_signature: bank_fields.fee_rate_governor.lamports_per_signature,
@@ -565,7 +546,7 @@ fn serialize_snapshot(
         let status_cache_path =
             bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STATUS_CACHE_FILENAME);
         let (status_cache_consumed_size, status_cache_serialize_us) = measure_us!(
-            serde_snapshot::serialize_status_cache(slot_deltas, &status_cache_path)
+            serde_snapshot::serialize_status_cache(status_cache_slot_deltas, &status_cache_path)
                 .map_err(|err| AddBankSnapshotError::SerializeStatusCache(Box::new(err)))?
         );
 
@@ -719,8 +700,7 @@ fn serialize_obsolete_accounts(
     let obsolete_accounts_path = bank_snapshot_dir
         .as_ref()
         .join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
-    let obsolete_accounts_file = fs::File::create(&obsolete_accounts_path)?;
-    let mut file_stream = BufWriter::new(obsolete_accounts_file);
+    let mut file_stream = large_file_buf_writer(&obsolete_accounts_path)?;
 
     serde_snapshot::serialize_into(&mut file_stream, obsolete_accounts_map)?;
 
@@ -767,7 +747,7 @@ fn deserialize_obsolete_accounts(
 
 pub fn serialize_snapshot_data_file<F>(data_file_path: &Path, serializer: F) -> Result<u64>
 where
-    F: FnOnce(&mut BufWriter<std::fs::File>) -> Result<()>,
+    F: FnOnce(&mut dyn Write) -> Result<()>,
 {
     serialize_snapshot_data_file_capped::<F>(
         data_file_path,
@@ -813,10 +793,9 @@ fn serialize_snapshot_data_file_capped<F>(
     serializer: F,
 ) -> Result<u64>
 where
-    F: FnOnce(&mut BufWriter<std::fs::File>) -> Result<()>,
+    F: FnOnce(&mut dyn Write) -> Result<()>,
 {
-    let data_file = fs::File::create(data_file_path)?;
-    let mut data_file_stream = BufWriter::new(data_file);
+    let mut data_file_stream = large_file_buf_writer(data_file_path)?;
     serializer(&mut data_file_stream)?;
     data_file_stream.flush()?;
 
@@ -1927,8 +1906,8 @@ mod tests {
             &temp_dir.path().join("data-file"),
             expected_consumed_size * 2,
             |stream| {
-                serialize_into(stream.by_ref(), &expected_data)?;
-                serialize_into(stream.by_ref(), &expected_data)?;
+                serialize_into(&mut *stream, &expected_data)?;
+                serialize_into(&mut *stream, &expected_data)?;
                 Ok(())
             },
         )

@@ -688,10 +688,6 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             compute_budget_and_limits,
         } = checked_details;
 
-        let compute_budget_and_limits = compute_budget_and_limits.inspect_err(|_err| {
-            error_counters.invalid_compute_budget += 1;
-        })?;
-
         let fee_payer_address = message.fee_payer();
 
         // We *must* use load_transaction_account() here because *this* is when the fee-payer
@@ -1087,9 +1083,13 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     == TRANSACTION_LEVEL_STACK_HEIGHT)
                 .unwrap_or(true));
 
-            let ix_trace = transaction_context.take_instruction_trace();
+            let (ix_trace, accounts, ix_data_trace) = transaction_context.take_instruction_trace();
             let mut outer_instructions = Vec::new();
-            for ix_in_trace in ix_trace.into_iter() {
+            for ((ix_in_trace, ix_data), ix_accounts) in ix_trace
+                .into_iter()
+                .zip(ix_data_trace.into_iter())
+                .zip(accounts)
+            {
                 let stack_height = ix_in_trace.nesting_level.saturating_add(1);
                 if stack_height == TRANSACTION_LEVEL_STACK_HEIGHT {
                     outer_instructions.push(Vec::new());
@@ -1098,9 +1098,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     inner_instructions.push(InnerInstruction {
                         instruction: CompiledInstruction::new_from_raw_parts(
                             ix_in_trace.program_account_index_in_tx as u8,
-                            ix_in_trace.instruction_data.into_owned(),
-                            ix_in_trace
-                                .instruction_accounts
+                            ix_data.into_owned(),
+                            ix_accounts
                                 .iter()
                                 .map(|acc| acc.index_in_transaction as u8)
                                 .collect(),
@@ -1197,7 +1196,7 @@ mod tests {
         solana_svm_callback::{AccountState, InvokeContextCallback},
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         solana_transaction_context::TransactionContext,
-        solana_transaction_error::{TransactionError, TransactionError::DuplicateInstruction},
+        solana_transaction_error::TransactionError,
         std::collections::HashMap,
         test_case::test_case,
     };
@@ -1988,11 +1987,8 @@ mod tests {
         assert_eq!(entry, Arc::new(program));
     }
 
-    #[test_case(false; "informal_loaded_size")]
-    #[test_case(true; "simd186_loaded_size")]
-    fn test_validate_transaction_fee_payer_exact_balance(
-        formalize_loaded_transaction_data_size: bool,
-    ) {
+    #[test]
+    fn test_validate_transaction_fee_payer_exact_balance() {
         let lamports_per_signature = 5000;
         let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
             &[
@@ -2024,12 +2020,10 @@ mod tests {
         );
         let mut mock_accounts = HashMap::new();
         mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
-        let mut mock_bank = MockBankCallback {
+        let mock_bank = MockBankCallback {
             account_shared_data: Arc::new(RwLock::new(mock_accounts)),
             ..Default::default()
         };
-        mock_bank.feature_set.formalize_loaded_transaction_data_size =
-            formalize_loaded_transaction_data_size;
         let mut account_loader = (&mock_bank).into();
 
         let mut error_counters = TransactionErrorMetrics::default();
@@ -2045,7 +2039,7 @@ mod tests {
             TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
                 &mut account_loader,
                 &message,
-                CheckedTransactionDetails::new(None, Ok(compute_budget_and_limits)),
+                CheckedTransactionDetails::new(None, compute_budget_and_limits),
                 &Hash::default(),
                 &rent,
                 &mut error_counters,
@@ -2056,12 +2050,6 @@ mod tests {
             account.set_rent_epoch(RENT_EXEMPT_RENT_EPOCH);
             account.set_lamports(0);
             account
-        };
-
-        let base_account_size = if formalize_loaded_transaction_data_size {
-            TRANSACTION_ACCOUNT_BASE_SIZE
-        } else {
-            0
         };
 
         assert_eq!(
@@ -2078,18 +2066,15 @@ mod tests {
                     .loaded_accounts_data_size_limit,
                 fee_details: FeeDetails::new(transaction_fee, priority_fee),
                 loaded_fee_payer_account: LoadedTransactionAccount {
-                    loaded_size: base_account_size + fee_payer_account.data().len(),
+                    loaded_size: TRANSACTION_ACCOUNT_BASE_SIZE + fee_payer_account.data().len(),
                     account: post_validation_fee_payer_account,
                 },
             })
         );
     }
 
-    #[test_case(false; "informal_loaded_size")]
-    #[test_case(true; "simd186_loaded_size")]
-    fn test_validate_transaction_fee_payer_rent_paying(
-        formalize_loaded_transaction_data_size: bool,
-    ) {
+    #[test]
+    fn test_validate_transaction_fee_payer_rent_paying() {
         let lamports_per_signature = 5000;
         let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
             &[],
@@ -2108,12 +2093,10 @@ mod tests {
 
         let mut mock_accounts = HashMap::new();
         mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
-        let mut mock_bank = MockBankCallback {
+        let mock_bank = MockBankCallback {
             account_shared_data: Arc::new(RwLock::new(mock_accounts)),
             ..Default::default()
         };
-        mock_bank.feature_set.formalize_loaded_transaction_data_size =
-            formalize_loaded_transaction_data_size;
         let mut account_loader = (&mock_bank).into();
 
         let mut error_counters = TransactionErrorMetrics::default();
@@ -2124,7 +2107,7 @@ mod tests {
             TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
                 &mut account_loader,
                 &message,
-                CheckedTransactionDetails::new(None, Ok(compute_budget_and_limits)),
+                CheckedTransactionDetails::new(None, compute_budget_and_limits),
                 &Hash::default(),
                 &rent,
                 &mut error_counters,
@@ -2134,12 +2117,6 @@ mod tests {
             let mut account = fee_payer_account.clone();
             account.set_lamports(starting_balance - transaction_fee);
             account
-        };
-
-        let base_account_size = if formalize_loaded_transaction_data_size {
-            TRANSACTION_ACCOUNT_BASE_SIZE
-        } else {
-            0
         };
 
         assert_eq!(
@@ -2156,7 +2133,7 @@ mod tests {
                     .loaded_accounts_data_size_limit,
                 fee_details: FeeDetails::new(transaction_fee, 0),
                 loaded_fee_payer_account: LoadedTransactionAccount {
-                    loaded_size: base_account_size + fee_payer_account.data().len(),
+                    loaded_size: TRANSACTION_ACCOUNT_BASE_SIZE + fee_payer_account.data().len(),
                     account: post_validation_fee_payer_account,
                 }
             })
@@ -2177,7 +2154,7 @@ mod tests {
                 &message,
                 CheckedTransactionDetails::new(
                     None,
-                    Ok(SVMTransactionExecutionAndFeeBudgetLimits::default()),
+                    SVMTransactionExecutionAndFeeBudgetLimits::default(),
                 ),
                 &Hash::default(),
                 &Rent::default(),
@@ -2210,13 +2187,13 @@ mod tests {
                 &message,
                 CheckedTransactionDetails::new(
                     None,
-                    Ok(SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+                    SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
                         MockBankCallback::calculate_fee_details(
                             &message,
                             lamports_per_signature,
                             0,
                         ),
-                    )),
+                    ),
                 ),
                 &Hash::default(),
                 &Rent::default(),
@@ -2253,13 +2230,13 @@ mod tests {
                 &message,
                 CheckedTransactionDetails::new(
                     None,
-                    Ok(SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+                    SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
                         MockBankCallback::calculate_fee_details(
                             &message,
                             lamports_per_signature,
                             0,
                         ),
-                    )),
+                    ),
                 ),
                 &Hash::default(),
                 &rent,
@@ -2294,13 +2271,13 @@ mod tests {
                 &message,
                 CheckedTransactionDetails::new(
                     None,
-                    Ok(SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+                    SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
                         MockBankCallback::calculate_fee_details(
                             &message,
                             lamports_per_signature,
                             0,
                         ),
-                    )),
+                    ),
                 ),
                 &Hash::default(),
                 &Rent::default(),
@@ -2312,35 +2289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_transaction_fee_payer_invalid_compute_budget() {
-        let message = new_unchecked_sanitized_message(Message::new(
-            &[
-                ComputeBudgetInstruction::set_compute_unit_limit(2000u32),
-                ComputeBudgetInstruction::set_compute_unit_limit(42u32),
-            ],
-            Some(&Pubkey::new_unique()),
-        ));
-
-        let mock_bank = MockBankCallback::default();
-        let mut account_loader = (&mock_bank).into();
-        let mut error_counters = TransactionErrorMetrics::default();
-        let result =
-            TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
-                &mut account_loader,
-                &message,
-                CheckedTransactionDetails::new(None, Err(DuplicateInstruction(1))),
-                &Hash::default(),
-                &Rent::default(),
-                &mut error_counters,
-            );
-
-        assert_eq!(error_counters.invalid_compute_budget.0, 1);
-        assert_eq!(result, Err(TransactionError::DuplicateInstruction(1u8)));
-    }
-
-    #[test_case(false; "informal_loaded_size")]
-    #[test_case(true; "simd186_loaded_size")]
-    fn test_validate_transaction_fee_payer_is_nonce(formalize_loaded_transaction_data_size: bool) {
+    fn test_validate_transaction_fee_payer_is_nonce() {
         let lamports_per_signature = 5000;
         let rent = Rent::default();
         let compute_unit_limit = 1000u64;
@@ -2362,43 +2311,44 @@ mod tests {
         let min_balance = Rent::default().minimum_balance(nonce::state::State::size());
         let priority_fee = compute_unit_limit;
 
+        let nonce_versions = nonce::versions::Versions::new(nonce::state::State::Initialized(
+            nonce::state::Data::new(
+                *fee_payer_address,
+                DurableNonce::default(),
+                lamports_per_signature,
+            ),
+        ));
+
+        let environment_blockhash = Hash::new_unique();
+        let next_durable_nonce = DurableNonce::from_blockhash(&environment_blockhash);
+
         // Sufficient Fees
         {
             let fee_payer_account = AccountSharedData::new_data(
                 min_balance + transaction_fee + priority_fee,
-                &nonce::versions::Versions::new(nonce::state::State::Initialized(
-                    nonce::state::Data::new(
-                        *fee_payer_address,
-                        DurableNonce::default(),
-                        lamports_per_signature,
-                    ),
-                )),
+                &nonce_versions,
                 &system_program::id(),
             )
             .unwrap();
 
-            let mut mock_accounts = HashMap::new();
-            mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
-            let mut mock_bank = MockBankCallback {
-                account_shared_data: Arc::new(RwLock::new(mock_accounts)),
-                ..Default::default()
-            };
-            mock_bank.feature_set.formalize_loaded_transaction_data_size =
-                formalize_loaded_transaction_data_size;
-            let mut account_loader = (&mock_bank).into();
-
-            let mut error_counters = TransactionErrorMetrics::default();
-
-            let environment_blockhash = Hash::new_unique();
-            let next_durable_nonce = DurableNonce::from_blockhash(&environment_blockhash);
             let mut future_nonce = NonceInfo::new(*fee_payer_address, fee_payer_account.clone());
             future_nonce
                 .try_advance_nonce(next_durable_nonce, lamports_per_signature)
                 .unwrap();
 
+            let mut mock_accounts = HashMap::new();
+            mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
+            let mock_bank = MockBankCallback {
+                account_shared_data: Arc::new(RwLock::new(mock_accounts)),
+                ..Default::default()
+            };
+            let mut account_loader = (&mock_bank).into();
+
+            let mut error_counters = TransactionErrorMetrics::default();
+
             let tx_details = CheckedTransactionDetails::new(
                 Some(future_nonce.clone()),
-                Ok(compute_budget_and_limits),
+                compute_budget_and_limits,
             );
 
             let result = TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
@@ -2417,12 +2367,6 @@ mod tests {
                 account
             };
 
-            let base_account_size = if formalize_loaded_transaction_data_size {
-                TRANSACTION_ACCOUNT_BASE_SIZE
-            } else {
-                0
-            };
-
             assert_eq!(
                 result,
                 Ok(ValidatedTransactionDetails {
@@ -2437,7 +2381,7 @@ mod tests {
                         .loaded_accounts_data_size_limit,
                     fee_details: FeeDetails::new(transaction_fee, priority_fee),
                     loaded_fee_payer_account: LoadedTransactionAccount {
-                        loaded_size: base_account_size + fee_payer_account.data().len(),
+                        loaded_size: TRANSACTION_ACCOUNT_BASE_SIZE + fee_payer_account.data().len(),
                         account: post_validation_fee_payer_account,
                     }
                 })
@@ -2448,12 +2392,15 @@ mod tests {
         {
             let fee_payer_account = AccountSharedData::new_data(
                 transaction_fee + priority_fee, // no min_balance this time
-                &nonce::versions::Versions::new(nonce::state::State::Initialized(
-                    nonce::state::Data::default(),
-                )),
+                &nonce_versions,
                 &system_program::id(),
             )
             .unwrap();
+
+            let mut future_nonce = NonceInfo::new(*fee_payer_address, fee_payer_account.clone());
+            future_nonce
+                .try_advance_nonce(next_durable_nonce, lamports_per_signature)
+                .unwrap();
 
             let mut mock_accounts = HashMap::new();
             mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
@@ -2464,11 +2411,17 @@ mod tests {
             let mut account_loader = (&mock_bank).into();
 
             let mut error_counters = TransactionErrorMetrics::default();
+
+            let tx_details = CheckedTransactionDetails::new(
+                Some(future_nonce.clone()),
+                compute_budget_and_limits,
+            );
+
             let result = TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
                 &mut account_loader,
                 &message,
-                CheckedTransactionDetails::new(None, Ok(compute_budget_and_limits)),
-                &Hash::default(),
+                tx_details,
+                &environment_blockhash,
                 &rent,
                 &mut error_counters,
                );
@@ -2510,9 +2463,9 @@ mod tests {
             &message,
             CheckedTransactionDetails::new(
                 None,
-                Ok(SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+                SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
                     MockBankCallback::calculate_fee_details(&message, 5000, 0),
-                )),
+                ),
             ),
             &Hash::default(),
             &Rent::default(),

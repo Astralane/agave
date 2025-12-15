@@ -134,8 +134,9 @@ fn render_dot(dot: String, output_file: &str, output_format: &str) -> io::Result
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 enum GraphVoteAccountMode {
+    #[default]
     Disabled,
     LastOnly,
     WithHistory,
@@ -160,12 +161,6 @@ impl AsRef<str> for GraphVoteAccountMode {
             Self::LastOnly => Self::LAST_ONLY,
             Self::WithHistory => Self::WITH_HISTORY,
         }
-    }
-}
-
-impl Default for GraphVoteAccountMode {
-    fn default() -> Self {
-        Self::Disabled
     }
 }
 
@@ -268,7 +263,7 @@ fn graph_forks(bank_forks: &BankForks, config: &GraphConfig) -> String {
                     bank.slot(),
                     bank.slot(),
                     bank.epoch(),
-                    bank.collector_id(),
+                    bank.leader_id(),
                     if let Some(parent) = bank.parent() {
                         format!(
                             "\ntransactions: {}",
@@ -859,8 +854,6 @@ fn main() {
         unsafe { signal_hook::low_level::register(signal_hook::consts::SIGUSR1, || {}) }.unwrap();
     }
 
-    agave_logger::setup_with_default_filter();
-
     let load_genesis_config_arg = load_genesis_arg();
     let accounts_db_config_args = accounts_db_args();
     let snapshot_config_args = snapshot_args();
@@ -971,6 +964,14 @@ fn main() {
                 .global(true)
                 .default_value("ledger")
                 .help("Use DIR as ledger location"),
+        )
+        .arg(
+            Arg::with_name("logfile")
+                .long("log")
+                .value_name("FILE")
+                .takes_value(true)
+                .global(true)
+                .help("Redirect logging to the specified file, stderr is used if unset"),
         )
         .arg(
             Arg::with_name("wal_recovery_mode")
@@ -1516,6 +1517,14 @@ fn main() {
                         .long("enable-capitalization-change")
                         .takes_value(false)
                         .help("If snapshot creation should succeed with a capitalization delta."),
+                )
+                .arg(
+                    Arg::with_name("fix_testnet_ed25519_precompile_account")
+                        .long("fix-testnet-ed25519-precompile-account")
+                        .help(
+                            "correct misassigned owner and data on testnet ed25519 precompile \
+                             account deployment",
+                        ),
                 ),
         )
         .subcommand(
@@ -1688,6 +1697,9 @@ fn main() {
         )
         .program_subcommand()
         .get_matches();
+
+    let logfile = value_t!(matches, "logfile", PathBuf).ok();
+    agave_logger::initialize_logging(logfile);
 
     info!("{} {}", crate_name!(), solana_version::version!());
 
@@ -2072,6 +2084,9 @@ fn main() {
                         archive_format
                     };
 
+                    let fix_testnet_ed25519_precompile_account =
+                        arg_matches.is_present("fix_testnet_ed25519_precompile_account");
+
                     let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
                     let mut process_options = parse_process_options(&ledger_path, arg_matches);
 
@@ -2142,6 +2157,7 @@ fn main() {
                         bank_forks,
                         starting_snapshot_hashes,
                         accounts_background_service,
+                        ..
                     } = load_and_process_ledger_or_exit(
                         arg_matches,
                         &genesis_config,
@@ -2172,14 +2188,12 @@ fn main() {
                         || !feature_gates_to_deactivate.is_empty()
                         || !vote_accounts_to_destake.is_empty()
                         || faucet_pubkey.is_some()
-                        || bootstrap_validator_pubkeys.is_some();
+                        || bootstrap_validator_pubkeys.is_some()
+                        || fix_testnet_ed25519_precompile_account;
 
                     if child_bank_required {
-                        let mut child_bank = Bank::new_from_parent(
-                            bank.clone(),
-                            bank.collector_id(),
-                            bank.slot() + 1,
-                        );
+                        let mut child_bank =
+                            Bank::new_from_parent(bank.clone(), bank.leader_id(), bank.slot() + 1);
 
                         if let Ok(rent_burn_percentage) = rent_burn_percentage {
                             child_bank.set_rent_burn_percentage(rent_burn_percentage);
@@ -2282,6 +2296,48 @@ fn main() {
                                 }
                             }
                         }
+                    }
+
+                    if fix_testnet_ed25519_precompile_account {
+                        use solana_sdk_ids::{ed25519_program, native_loader, system_program};
+
+                        if bank.cluster_type() != ClusterType::Testnet {
+                            eprintln!(
+                                "--fix-testnet-ed25519-precompile-account is incompatible with \
+                                 the supplied base snapshot"
+                            );
+                            std::process::exit(1);
+                        }
+
+                        let mut ed25519_program_account =
+                            bank.get_account(&ed25519_program::id()).unwrap_or_else(|| {
+                                eprintln!("Error: `{}` is not deployed", ed25519_program::id());
+                                exit(1);
+                            });
+
+                        if ed25519_program_account.owner() != &system_program::id() {
+                            eprintln!(
+                                "Error: expected `{}` to be owned by `{}`, found `{}`",
+                                ed25519_program::id(),
+                                system_program::id(),
+                                ed25519_program_account.owner(),
+                            );
+                            exit(1);
+                        }
+
+                        if !ed25519_program_account.data().is_empty() {
+                            eprintln!(
+                                "Error: expected `{}` account data to be empty, found {} bytes",
+                                ed25519_program::id(),
+                                ed25519_program_account.data().len(),
+                            );
+                            exit(1);
+                        }
+
+                        ed25519_program_account.set_owner(native_loader::id());
+                        ed25519_program_account.set_data_from_slice(b"ed25519_program");
+
+                        bank.store_account(&ed25519_program::id(), &ed25519_program_account);
                     }
 
                     if let Some(bootstrap_validator_pubkeys) = bootstrap_validator_pubkeys {
@@ -2425,7 +2481,7 @@ fn main() {
                         bank.force_flush_accounts_cache();
                         Arc::new(Bank::warp_from_parent(
                             bank.clone(),
-                            bank.collector_id(),
+                            bank.leader_id(),
                             warp_slot,
                         ))
                     } else {
@@ -2579,14 +2635,17 @@ fn main() {
                         AccessType::PrimaryForMaintenance,
                     ));
                     let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
-                    let LoadAndProcessLedgerOutput { bank_forks, .. } =
-                        load_and_process_ledger_or_exit(
-                            arg_matches,
-                            &genesis_config,
-                            blockstore.clone(),
-                            process_options,
-                            None, // transaction status sender
-                        );
+                    let LoadAndProcessLedgerOutput {
+                        bank_forks,
+                        unified_scheduler_pool,
+                        ..
+                    } = load_and_process_ledger_or_exit(
+                        arg_matches,
+                        &genesis_config,
+                        blockstore.clone(),
+                        process_options,
+                        None, // transaction status sender
+                    );
 
                     let block_production_method = value_t_or_exit!(
                         arg_matches,
@@ -2601,6 +2660,7 @@ fn main() {
                         bank_forks,
                         blockstore,
                         block_production_method,
+                        unified_scheduler_pool,
                     ) {
                         Ok(()) => println!("Ok"),
                         Err(error) => {
@@ -2909,7 +2969,7 @@ fn main() {
                         };
                         let warped_bank = Bank::new_from_parent_with_tracer(
                             base_bank.clone(),
-                            base_bank.collector_id(),
+                            base_bank.leader_id(),
                             next_epoch,
                             tracer,
                         );
